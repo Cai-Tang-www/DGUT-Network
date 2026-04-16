@@ -1,78 +1,69 @@
-# DGUT-Network
+﻿# 东莞理工学院校园网自动化脚本（DGUT-Network）
 
-> 校园网自动认证脚本（DGUT 优先适配），支持未联网状态自动抓取会话参数、自动登录、循环保活检测，以及 Windows 开机后台运行。
+> 面向东莞理工学院（DGUT）校园网认证场景的自动登录脚本，支持自动检测未联网、自动抓取会话参数、自动认证、后台循环保活。
 
 ## 免责声明
 
 - 本项目仅用于个人网络运维与学习研究。
-- 请遵守学校与网络服务提供方的相关规定。
-- 使用本项目造成的后果由使用者自行承担。
+- 请遵守学校与网络服务提供方相关规定。
+- 使用本项目造成的任何后果由使用者自行承担。
 
 ## 项目简介
 
-本仓库用于解决校园网认证场景中的两个常见问题：
+这个项目用于解决校园网 portal 认证中的常见问题：
 
-- 网络被认证页劫持时，HTTP 状态码可能仍是 `200`，导致普通“联网检测”误判。
-- 登录参数中的 `queryString` 会话值是动态的，不能长期硬编码。
+- 认证劫持页面返回 `200`，导致“只看状态码”的联网检测误判。
+- `queryString` 属于动态会话参数，不能长期硬编码。
+- 部分门户环境下 HTTPS/TLS 兼容性较差，默认请求库可能握手失败。
 
-脚本会在检测到“未真正联网”后，自动尝试抓取当前会话 `queryString`，获取 `pageInfo`，并按门户要求提交登录请求（支持 RSA 模式）。
+脚本会在检测到未联网或被认证劫持时，自动尝试抓取当前会话 `queryString`，调用 `pageInfo`，并提交登录请求（支持 RSA 模式）。
 
 ## 适用范围
 
-- 已在东莞理工学院（DGUT）网络环境验证。
-- 同样适用于其他高校中“同类 portal/eportal 认证流程”的校园网。
-- 若其他学校接口字段不同，通常只需调整 `base_url` / `captive_host` / `captive_path` 及少量请求参数。
-- 如果目标门户没有 `pageInfo` 或使用完全不同的加密方案，需要按学校页面 JS 再做适配。
+- 已针对东莞理工学院（DGUT）校园网流程适配。
+- 也可用于其他高校中同类 `portal/eportal` 认证系统。
+- 迁移到其他学校时，通常只需调整：`base_url`、`captive_host`、`captive_path`，必要时补充字段适配。
 
 ## 功能特性
 
-- 自动联网检测（识别 portal 劫持，不只看 `200`）
+- 识别 portal 劫持的联网检测（不只依赖 HTTP `200`）
 - 自动抓取当次会话 `queryString`
-- 自动调用 `pageInfo` 并按需 RSA 加密密码
-- 可配置循环模式（`--loop`）
+- 自动获取 `pageInfo` 并按需执行 RSA 登录参数加密
 - 支持 YAML 配置 + 环境变量覆盖
-- 支持 `curl_cffi` 作为 TLS 兼容后端（处理部分门户握手问题）
-- 支持 Windows 后台无界面启动 + 计划任务开机自启
-- 支持文件日志轮转（便于长期运行排障）
+- 支持循环模式（`--loop`）
+- 支持 `curl_cffi` 兼容 TLS 握手
+- 支持日志文件输出与轮转
+- 支持 Windows 后台无界面启动与开机自启动
 
-## 使用说明
+## 快速开始
 
-### 1) 环境准备
-
-- Python 3.10+（仅源码运行需要）
-- 依赖安装：
-
-```powershell
-pip install requests urllib3 curl_cffi
-```
-
-### 2) 配置文件
-
-复制模板并填写账号密码：
+### 1. 配置账号
 
 ```powershell
 copy config.yaml.example config.yaml
 ```
 
-关键字段：
+编辑 `config.yaml`：
 
 - `user_id`：学号/账号
 - `password`：密码
-- `base_url`：认证门户地址（默认 DGUT）
-- `loop_interval`：循环检测间隔（秒）
-- `log_file`：日志文件路径
+- `base_url`：认证门户地址（DGUT 默认已内置）
 
-完整字段见：[`docs/CONFIG.md`](./docs/CONFIG.md)
+### 2. 源码运行
 
-### 3) 源码运行（调试）
+安装依赖：
 
-单次检测/登录：
+```powershell
+pip install requests urllib3 curl_cffi
+```
+
+单次检测登录：
 
 ```powershell
 py campus_login.py
 ```
 
-循环运行：
+循环模式：
 
 ```powershell
 py campus_login.py --loop
@@ -84,15 +75,13 @@ py campus_login.py --loop
 py campus_login.py --loop --interval 30
 ```
 
-### 4) 打包版运行（无 Python 环境）
-
-打包版可直接运行 `dist\campus_login.exe`，目标机无需安装 Python：
+### 3. 打包版运行（无 Python 环境）
 
 ```powershell
 .\dist\campus_login.exe --loop
 ```
 
-### 5) Windows 后台无界面运行
+## Windows 后台无界面运行
 
 手动后台启动：
 
@@ -100,7 +89,7 @@ py campus_login.py --loop --interval 30
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden.ps1
 ```
 
-开机自启（管理员 PowerShell）：
+安装开机自启动（管理员 PowerShell）：
 
 ```powershell
 .\install_startup_task.ps1
@@ -118,20 +107,16 @@ Get-ScheduledTask -TaskName "CampusLoginAutoLoop"
 Unregister-ScheduledTask -TaskName "CampusLoginAutoLoop" -Confirm:$false
 ```
 
-### 6) 日志与排障
+## 日志与排障
 
-- 默认日志按 `config.yaml` 中 `log_file` 输出（支持轮转）。
-- 常见报错关键字：
-  - `DNS失败`
-  - `超时`
-  - `TLS握手失败`
-  - `未获取到 queryString`
-- 若处于代理环境，需在代理软件中放行认证域名与探测域名。
+- 日志路径由 `config.yaml` 中 `log_file` 控制（支持轮转）。
+- 常见关键字：`DNS失败`、`超时`、`TLS握手失败`、`未获取到 queryString`。
 
-## 配置说明
+## 文档
 
-- 详细字段说明：[`docs/CONFIG.md`](./docs/CONFIG.md)
-- Windows 后台运行与开机自启：[`docs/DEPLOYMENT_WINDOWS.md`](./docs/DEPLOYMENT_WINDOWS.md)
+- 配置项说明：[`docs/CONFIG.md`](./docs/CONFIG.md)
+- Windows 部署说明：[`docs/DEPLOYMENT_WINDOWS.md`](./docs/DEPLOYMENT_WINDOWS.md)
+- 自启动任务说明：[`AUTOSTART_TASK.md`](./AUTOSTART_TASK.md)
 
 ## 许可证
 
