@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Build outputs
+build/
+dist/
+tmp/
+tmp_ref*/
+
+# Local runtime files
+*.log
+
+# Local secrets
+config.yaml
+*request_login.dgut.edu.cn_message.txt

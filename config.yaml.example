@@ -1,0 +1,23 @@
+﻿# 复制本文件为 config.yaml 后再填写
+base_url: "https://login.dgut.edu.cn"
+user_id: "你的学号"
+password: "你的密码"
+
+# 可选项
+verify_tls: false
+captive_query_string: ""
+debug_query_fetch: false
+force_rsa_encrypt: true
+use_curl_cffi: true
+curl_impersonate: "chrome124"
+query_fetch_retries: 3
+query_fetch_retry_delay: 3
+loop_interval: 20
+captive_host: "login.dgut.edu.cn"
+captive_path: "/eportal/index.jsp"
+
+# 日志配置（后台运行建议开启文件日志）
+log_file: "./campus_login.log"
+log_level: "INFO"
+log_max_size_mb: 5
+log_backup_count: 3
