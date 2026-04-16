@@ -1,6 +1,6 @@
 # DGUT-Network
 
-> 校园网自动认证脚本（DGUT），支持未联网状态自动抓取会话参数、自动登录、循环保活检测，以及 Windows 开机后台运行。
+> 校园网自动认证脚本（DGUT 优先适配），支持未联网状态自动抓取会话参数、自动登录、循环保活检测，以及 Windows 开机后台运行。
 
 ## 免责声明
 
@@ -17,6 +17,13 @@
 
 脚本会在检测到“未真正联网”后，自动尝试抓取当前会话 `queryString`，获取 `pageInfo`，并按门户要求提交登录请求（支持 RSA 模式）。
 
+## 适用范围
+
+- 已在东莞理工学院（DGUT）网络环境验证。
+- 同样适用于其他高校中“同类 portal/eportal 认证流程”的校园网。
+- 若其他学校接口字段不同，通常只需调整 `base_url` / `captive_host` / `captive_path` 及少量请求参数。
+- 如果目标门户没有 `pageInfo` 或使用完全不同的加密方案，需要按学校页面 JS 再做适配。
+
 ## 功能特性
 
 - 自动联网检测（识别 portal 劫持，不只看 `200`）
@@ -28,69 +35,103 @@
 - 支持 Windows 后台无界面启动 + 计划任务开机自启
 - 支持文件日志轮转（便于长期运行排障）
 
-## 仓库结构
+## 使用说明
 
-```text
-campus_login.py              # 主程序
-config.yaml.example          # 配置模板
-start_loop.bat               # 前台循环启动（便于调试）
-start_hidden.ps1             # 后台无界面启动入口
-install_startup_task.ps1     # 安装开机自启计划任务
-AUTOSTART_TASK.md            # 自启动运维说明
-docs/CONFIG.md               # 配置项详细说明
-docs/DEPLOYMENT_WINDOWS.md   # Windows 部署说明
+### 1) 环境准备
+
+- Python 3.10+（仅源码运行需要）
+- 依赖安装：
+
+```powershell
+pip install requests urllib3 curl_cffi
 ```
 
-## 快速开始
+### 2) 配置文件
 
-1. 复制配置模板并填写账号密码：
+复制模板并填写账号密码：
 
 ```powershell
 copy config.yaml.example config.yaml
 ```
 
-2. 单次运行（调试）：
+关键字段：
+
+- `user_id`：学号/账号
+- `password`：密码
+- `base_url`：认证门户地址（默认 DGUT）
+- `loop_interval`：循环检测间隔（秒）
+- `log_file`：日志文件路径
+
+完整字段见：[`docs/CONFIG.md`](./docs/CONFIG.md)
+
+### 3) 源码运行（调试）
+
+单次检测/登录：
 
 ```powershell
 py campus_login.py
 ```
 
-3. 循环运行：
+循环运行：
 
 ```powershell
 py campus_login.py --loop
 ```
 
-> 打包版可直接运行 `dist\campus_login.exe`，目标机无需安装 Python。
+自定义循环间隔：
 
-## 配置说明
+```powershell
+py campus_login.py --loop --interval 30
+```
 
-- 详细字段说明：[`docs/CONFIG.md`](./docs/CONFIG.md)
-- Windows 后台运行与开机自启：[`docs/DEPLOYMENT_WINDOWS.md`](./docs/DEPLOYMENT_WINDOWS.md)
+### 4) 打包版运行（无 Python 环境）
 
-## 运维命令（计划任务）
+打包版可直接运行 `dist\campus_login.exe`，目标机无需安装 Python：
 
-安装（管理员 PowerShell）：
+```powershell
+.\dist\campus_login.exe --loop
+```
+
+### 5) Windows 后台无界面运行
+
+手动后台启动：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden.ps1
+```
+
+开机自启（管理员 PowerShell）：
 
 ```powershell
 .\install_startup_task.ps1
 ```
 
-查看：
+查看任务：
 
 ```powershell
 Get-ScheduledTask -TaskName "CampusLoginAutoLoop"
 ```
 
-删除：
+删除任务：
 
 ```powershell
 Unregister-ScheduledTask -TaskName "CampusLoginAutoLoop" -Confirm:$false
 ```
 
-## 参考
+### 6) 日志与排障
 
-- 文档结构参考：<https://github.com/mjz001/-dgut->
+- 默认日志按 `config.yaml` 中 `log_file` 输出（支持轮转）。
+- 常见报错关键字：
+  - `DNS失败`
+  - `超时`
+  - `TLS握手失败`
+  - `未获取到 queryString`
+- 若处于代理环境，需在代理软件中放行认证域名与探测域名。
+
+## 配置说明
+
+- 详细字段说明：[`docs/CONFIG.md`](./docs/CONFIG.md)
+- Windows 后台运行与开机自启：[`docs/DEPLOYMENT_WINDOWS.md`](./docs/DEPLOYMENT_WINDOWS.md)
 
 ## 许可证
 
