@@ -83,6 +83,22 @@ py campus_login.py --loop --interval 30
 
 ## Windows 后台无界面运行
 
+### 方案 A：`py` 版（本地更轻量，推荐）
+
+手动后台启动：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden_py.ps1
+```
+
+一键安装自启动任务（默认“当前用户登录后自动启动”）：
+
+```powershell
+.\install_startup_task_py.ps1
+```
+
+### 方案 B：`exe` 版（无 Python 环境机器）
+
 手动后台启动：
 
 ```powershell
@@ -99,12 +115,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden.ps1
 
 ```powershell
 Get-ScheduledTask -TaskName "CampusLoginAutoLoop"
+Get-ScheduledTask -TaskName "CampusLoginAutoLoopPy"
 ```
 
 删除任务：
 
 ```powershell
 Unregister-ScheduledTask -TaskName "CampusLoginAutoLoop" -Confirm:$false
+Unregister-ScheduledTask -TaskName "CampusLoginAutoLoopPy" -Confirm:$false
 ```
 
 ## 日志与排障
