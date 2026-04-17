@@ -81,49 +81,56 @@ py campus_login.py --loop --interval 30
 .\dist\campus_login.exe --loop
 ```
 
-## Windows 后台无界面运行
+## Windows 后台无界面运行（推荐）
 
-### 方案 A：`py` 版（本地更轻量，推荐）
-
-手动后台启动：
+如果服务器限制未签名 PowerShell 脚本，优先使用 `bat + vbs + 计划任务` 方案：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden_py.ps1
+.\install_autostart_safe.bat
 ```
 
-一键安装自启动任务（默认“当前用户登录后自动启动”）：
+该命令会创建 3 个计划任务：
 
-```powershell
-.\install_startup_task_py.ps1
-```
+- `CampusLoginAutoLoopPy_OnStart`（开机触发，SYSTEM）
+- `CampusLoginAutoLoopPy_OnLogon`（登录触发）
+- `CampusLoginAutoLoopPy_Watchdog`（每 5 分钟兜底拉起）
 
-### 方案 B：`exe` 版（无 Python 环境机器）
+其中启动入口是：
 
-手动后台启动：
+- `start_loop_py_background.vbs`（隐藏运行）
+- `start_loop_py_background.bat`（后台启动 `campus_login.py --loop`）
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden.ps1
-```
-
-安装开机自启动（管理员 PowerShell）：
-
-```powershell
-.\install_startup_task.ps1
-```
+当前代码已内置循环单实例锁，多任务同时触发也只会保留一个主循环进程。
 
 查看任务：
 
 ```powershell
-Get-ScheduledTask -TaskName "CampusLoginAutoLoop"
-Get-ScheduledTask -TaskName "CampusLoginAutoLoopPy"
+schtasks /Query /TN "CampusLoginAutoLoopPy_OnStart" /V /FO LIST
+schtasks /Query /TN "CampusLoginAutoLoopPy_OnLogon" /V /FO LIST
+schtasks /Query /TN "CampusLoginAutoLoopPy_Watchdog" /V /FO LIST
 ```
 
 删除任务：
 
 ```powershell
-Unregister-ScheduledTask -TaskName "CampusLoginAutoLoop" -Confirm:$false
-Unregister-ScheduledTask -TaskName "CampusLoginAutoLoopPy" -Confirm:$false
+schtasks /Delete /TN "CampusLoginAutoLoopPy_OnStart" /F
+schtasks /Delete /TN "CampusLoginAutoLoopPy_OnLogon" /F
+schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog" /F
 ```
+
+说明：有了这 3 个计划任务后，`Startup` 文件夹快捷方式不是必须，可移除。
+
+## 健康检查（不断网）
+
+```powershell
+.\check_runtime_no_disconnect.bat
+```
+
+会输出到 `healthcheck.log`，用于验证：
+
+- 依赖与配置可用
+- 单次检测流程可执行
+- 当前机器后台 Python 进程快照
 
 ## 日志与排障
 

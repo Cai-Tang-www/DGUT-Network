@@ -259,6 +259,7 @@ def setup_logger():
 
 
 LOGGER = setup_logger()
+SINGLE_INSTANCE_HANDLE = None
 
 
 def log(level, msg):
@@ -273,6 +274,48 @@ def log(level, msg):
     if level == "OK":
         msg = f"[OK] {msg}"
     LOGGER.log(py_level, msg)
+
+
+def acquire_single_instance_lock(lock_path):
+    global SINGLE_INSTANCE_HANDLE
+    try:
+        lock_dir = os.path.dirname(lock_path)
+        if lock_dir:
+            os.makedirs(lock_dir, exist_ok=True)
+
+        fh = open(lock_path, "a+", encoding="utf-8")
+        fh.seek(0)
+        if os.path.getsize(lock_path) == 0:
+            fh.write("0")
+            fh.flush()
+        fh.seek(0)
+
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                fh.close()
+                return False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.close()
+                return False
+
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        SINGLE_INSTANCE_HANDLE = fh
+        return True
+    except Exception as err:
+        log("WARN", f"单实例锁初始化失败: {short_exc(err)}")
+        return True
 
 
 def short_exc(err, limit=140):
@@ -792,6 +835,11 @@ def main():
     interval = parse_interval(sys.argv)
 
     if loop_mode:
+        lock_base_dir = os.path.dirname(os.path.abspath(CONFIG_FILE)) if CONFIG_FILE else APP_DIR
+        lock_path = resolve_path("campus_login.lock", lock_base_dir or APP_DIR)
+        if not acquire_single_instance_lock(lock_path):
+            log("WARN", f"检测到已有循环实例在运行，退出。lock={lock_path}")
+            return
         run_loop(interval)
     else:
         run_once()
