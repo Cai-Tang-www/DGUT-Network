@@ -35,97 +35,127 @@
 - 支持日志文件输出与轮转
 - 支持 Windows 后台无界面启动与开机自启动
 
-## 快速开始
+## 上线操作清单（建议按顺序执行）
 
-### 1. 配置账号
+### 1. 基础配置
 
 ```powershell
 copy config.yaml.example config.yaml
 ```
 
-编辑 `config.yaml`：
+编辑 `config.yaml`（至少填写）：
 
 - `user_id`：学号/账号
 - `password`：密码
 - `base_url`：认证门户地址（DGUT 默认已内置）
 
-### 2. 源码运行
+### 2. 选择运行方式（py / exe）
 
-安装依赖：
+#### A) `py` 方式（调试方便）
+
+安装依赖（注意必须和 `py` 同环境）：
 
 ```powershell
-pip install requests urllib3 curl_cffi
+py -m pip install requests urllib3 curl_cffi
 ```
 
-单次检测登录：
+单次运行：
 
 ```powershell
 py campus_login.py
 ```
 
-循环模式：
+循环运行：
 
 ```powershell
 py campus_login.py --loop
 ```
 
-自定义循环间隔：
-
-```powershell
-py campus_login.py --loop --interval 30
-```
-
-### 3. 打包版运行（无 Python 环境）
+#### B) `exe` 方式（服务器更稳，不依赖 Python）
 
 ```powershell
 .\dist\campus_login.exe --loop
 ```
 
-## Windows 后台无界面运行（推荐）
+说明：`exe` 会读取同目录 `config.yaml`（或 `CAMPUS_CONFIG_FILE` 指定路径）。
 
-### 方案 A：管理员模式（开机未登录也启动）
+## 自动启动（管理员模式，开机未登录也启动）
 
-右键“以管理员身份运行”：
+### 1. py 版 SYSTEM 任务（推荐）
+
+管理员终端执行：
 
 ```powershell
 .\install_onstart_system.bat
 ```
 
-会创建 2 个 SYSTEM 任务：
+会创建：
 
 - `CampusLoginAutoLoopPy_OnStart_SYSTEM`（开机触发）
 - `CampusLoginAutoLoopPy_Watchdog_SYSTEM`（每 5 分钟兜底）
 
-查看任务：
+### 2. exe 版 SYSTEM 任务（可选）
+
+如果你改用 `exe` 常驻，管理员终端可直接执行：
+
+```powershell
+schtasks /Create /TN "CampusLoginAutoLoopExe_OnStart_SYSTEM" /TR "\"G:\校园网日志\dist\campus_login.exe\" --loop" /SC ONSTART /RU SYSTEM /RL HIGHEST /F
+schtasks /Create /TN "CampusLoginAutoLoopExe_Watchdog_SYSTEM" /TR "\"G:\校园网日志\dist\campus_login.exe\" --loop" /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /F
+```
+
+## 如何确认任务已创建且有效
+
+### 1. 查任务详情
 
 ```powershell
 schtasks /Query /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /V /FO LIST
 schtasks /Query /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /V /FO LIST
 ```
 
-删除任务：
+重点看：
+
+- `作为用户运行: SYSTEM`
+- `计划任务状态: 已启用`
+- `上次结果: 0` 或 `0x0`
+
+### 2. 手动触发一次验证
 
 ```powershell
-schtasks /Delete /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /F
-schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /F
+schtasks /Run /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM"
+Start-Sleep -Seconds 5
 ```
 
-### 方案 B：受限权限模式（登录后启动）
+### 3. 检查后台进程
 
-如果机器策略不允许创建 SYSTEM 任务，可使用：
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like "*campus_login.py*" -and $_.CommandLine -like "*--loop*" } |
+  Select-Object ProcessId,Name,CommandLine
+```
+
+若为 `exe` 方案，检查：
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq "campus_login.exe" } |
+  Select-Object ProcessId,Name,CommandLine
+```
+
+### 4. 检查日志是否持续刷新
+
+```powershell
+Get-Content -Tail 80 .\campus_login.log
+Get-Content -Tail 80 .\runner.log
+```
+
+## 受限权限模式（无法创建 SYSTEM 任务时）
 
 ```powershell
 .\install_autostart_safe.bat
 ```
 
-该脚本会创建登录触发 + 看门狗任务；你也可以仅保留 Startup + `HKCU\Run` 方式。
-
-### 启动入口
-
-- `start_loop_py_background.vbs`（隐藏运行）
-- `start_loop_py_background.bat`（后台启动 `campus_login.py --loop`）
-
-当前代码已内置循环单实例锁，多触发也只会保留一个循环实例。
+该模式为“登录后启动 + 看门狗”。  
+若你已经切到 SYSTEM 模式，建议移除 Startup/HKCU 启动项，避免双触发噪音。
 
 ## 健康检查（不断网）
 
@@ -133,16 +163,17 @@ schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /F
 .\check_runtime_no_disconnect.bat
 ```
 
-会输出到 `healthcheck.log`，用于验证：
+输出文件：
 
-- 依赖与配置可用
-- 单次检测流程可执行
-- 当前机器后台 Python 进程快照
+- `healthcheck.log`（单次自检结果）
+- `campus_login.log`（主循环日志）
 
-## 日志与排障
+## 常见故障排查
 
-- 日志路径由 `config.yaml` 中 `log_file` 控制（支持轮转）。
-- 常见关键字：`DNS失败`、`超时`、`TLS握手失败`、`未获取到 queryString`。
+- `ModuleNotFoundError: requests`：使用 `py -m pip install ...`，不要单独 `pip install`
+- `Access is denied`（创建任务）：需管理员权限，且命令在管理员终端执行
+- 能跑但看不到进程：Win10 任务管理器看“详细信息”中的 `pythonw.exe/pyw.exe`
+- 多进程担忧：代码含单实例锁，重复触发会自动退出后续实例
 
 ## 文档
 
