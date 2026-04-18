@@ -175,6 +175,55 @@ Get-Content -Tail 80 .\runner.log
 - 能跑但看不到进程：Win10 任务管理器看“详细信息”中的 `pythonw.exe/pyw.exe`
 - 多进程担忧：代码含单实例锁，重复触发会自动退出后续实例
 
+### 新电脑无法自动抓取 `queryString`
+
+症状（日志常见）：
+
+- `抓取queryString失败`
+- `未获取到 queryString`
+- `ConnectionError` / `Max retries exceeded`
+
+处理步骤：
+
+1. 浏览器访问 `http://neverssl.com`（必须 http）触发认证跳转。
+2. 复制 `index.jsp?` 后整段参数，临时写入 `config.yaml`：
+
+```yaml
+captive_query_string: "这里填完整参数串"
+debug_query_fetch: true
+```
+
+3. 先执行一次 `py campus_login.py` 验证登录链路。
+4. 验证通过后可清空 `captive_query_string`，继续使用自动抓取。
+
+### 代理绕过（Clash / 系统代理）
+
+如果开了代理，认证流量被代理劫持会导致抓不到 `queryString`。  
+建议将以下目标设为直连（DIRECT）：
+
+- `login.dgut.edu.cn`
+- `10.60.0.1`
+- `1.1.1.1`
+- `114.114.114.114`
+- `www.baidu.com`
+- `www.bing.com`
+- `www.msftconnecttest.com`
+- `connect.rom.miui.com`
+
+示例（Clash 规则片段）：
+
+```yaml
+rules:
+  - DOMAIN,login.dgut.edu.cn,DIRECT
+  - DOMAIN,www.baidu.com,DIRECT
+  - DOMAIN,www.bing.com,DIRECT
+  - DOMAIN,www.msftconnecttest.com,DIRECT
+  - DOMAIN,connect.rom.miui.com,DIRECT
+  - IP-CIDR,10.60.0.1/32,DIRECT,no-resolve
+  - IP-CIDR,1.1.1.1/32,DIRECT,no-resolve
+  - IP-CIDR,114.114.114.114/32,DIRECT,no-resolve
+```
+
 ## 文档
 
 - 配置项说明：[`docs/CONFIG.md`](./docs/CONFIG.md)
