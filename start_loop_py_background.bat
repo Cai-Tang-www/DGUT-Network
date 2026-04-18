@@ -36,6 +36,21 @@ if not defined PY_CMD (
 )
 
 if not defined PY_CMD (
+  for /f "delims=" %%I in ('where /r "C:\Users" pythonw.exe 2^>nul') do (
+    set "PY_CMD=%%~fI"
+    goto :py_found
+  )
+)
+
+if not defined PY_CMD (
+  for /f "delims=" %%I in ('where /r "C:\Users" python.exe 2^>nul') do (
+    set "PY_CMD=%%~fI"
+    goto :py_found
+  )
+)
+
+:py_found
+if not defined PY_CMD (
   echo [%date% %time%] ERROR python launcher not found>>"%RUN_LOG%" 2>nul
   exit /b 2
 )
@@ -50,8 +65,10 @@ if /i "%PY_CMD%"=="pyw" (
   start "" /min pythonw "%SCRIPT%" --loop
 ) else if /i "%PY_CMD%"=="py" (
   start "" /min py "%SCRIPT%" --loop
-) else (
+) else if /i "%PY_CMD%"=="python" (
   start "" /min python "%SCRIPT%" --loop
+) else (
+  start "" /min "%PY_CMD%" "%SCRIPT%" --loop
 )
 
 exit /b 0

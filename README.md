@@ -83,42 +83,49 @@ py campus_login.py --loop --interval 30
 
 ## Windows 后台无界面运行（推荐）
 
-如果服务器限制未签名 PowerShell 脚本，优先使用 `bat + vbs + 计划任务` 方案：
+### 方案 A：管理员模式（开机未登录也启动）
+
+右键“以管理员身份运行”：
 
 ```powershell
-.\install_autostart_safe.bat
+.\install_onstart_system.bat
 ```
 
-该命令会创建 3 个计划任务：
+会创建 2 个 SYSTEM 任务：
 
-- `CampusLoginAutoLoopPy_OnStart`（开机触发，SYSTEM）
-- `CampusLoginAutoLoopPy_OnLogon`（登录触发）
-- `CampusLoginAutoLoopPy_Watchdog`（每 5 分钟兜底拉起）
-
-其中启动入口是：
-
-- `start_loop_py_background.vbs`（隐藏运行）
-- `start_loop_py_background.bat`（后台启动 `campus_login.py --loop`）
-
-当前代码已内置循环单实例锁，多任务同时触发也只会保留一个主循环进程。
+- `CampusLoginAutoLoopPy_OnStart_SYSTEM`（开机触发）
+- `CampusLoginAutoLoopPy_Watchdog_SYSTEM`（每 5 分钟兜底）
 
 查看任务：
 
 ```powershell
-schtasks /Query /TN "CampusLoginAutoLoopPy_OnStart" /V /FO LIST
-schtasks /Query /TN "CampusLoginAutoLoopPy_OnLogon" /V /FO LIST
-schtasks /Query /TN "CampusLoginAutoLoopPy_Watchdog" /V /FO LIST
+schtasks /Query /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /V /FO LIST
+schtasks /Query /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /V /FO LIST
 ```
 
 删除任务：
 
 ```powershell
-schtasks /Delete /TN "CampusLoginAutoLoopPy_OnStart" /F
-schtasks /Delete /TN "CampusLoginAutoLoopPy_OnLogon" /F
-schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog" /F
+schtasks /Delete /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /F
+schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /F
 ```
 
-说明：有了这 3 个计划任务后，`Startup` 文件夹快捷方式不是必须，可移除。
+### 方案 B：受限权限模式（登录后启动）
+
+如果机器策略不允许创建 SYSTEM 任务，可使用：
+
+```powershell
+.\install_autostart_safe.bat
+```
+
+该脚本会创建登录触发 + 看门狗任务；你也可以仅保留 Startup + `HKCU\Run` 方式。
+
+### 启动入口
+
+- `start_loop_py_background.vbs`（隐藏运行）
+- `start_loop_py_background.bat`（后台启动 `campus_login.py --loop`）
+
+当前代码已内置循环单实例锁，多触发也只会保留一个循环实例。
 
 ## 健康检查（不断网）
 
