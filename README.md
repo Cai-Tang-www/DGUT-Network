@@ -228,7 +228,6 @@ rules:
 
 - 配置项说明：[`docs/CONFIG.md`](./docs/CONFIG.md)
 - Windows 部署说明：[`docs/DEPLOYMENT_WINDOWS.md`](./docs/DEPLOYMENT_WINDOWS.md)
-- 自启动任务说明：[`AUTOSTART_TASK.md`](./AUTOSTART_TASK.md)
 
 ## 许可证
 

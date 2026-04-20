@@ -4,58 +4,76 @@
 
 建议至少准备以下文件：
 
-- `campus_login.exe`（onefile 打包产物）
+- `campus_login.py` 或 `dist\campus_login.exe`
 - `config.yaml`
-- `start_hidden.ps1`
-- `install_startup_task.ps1`
+- `start_loop_py_background.vbs`
+- `start_loop_py_background.bat`
+
+若使用管理员 SYSTEM 开机任务，还需要：
+
+- `install_onstart_system.bat`
 
 ## 2. 手动后台启动（无窗口）
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\start_hidden.ps1
+cmd /c .\start_loop_py_background.bat
 ```
 
 说明：
 
-- 脚本会优先查找 `.\campus_login.exe`，找不到则尝试 `.\dist\campus_login.exe`
-- 会自动设置 `CAMPUS_CONFIG_FILE` 指向同目录 `config.yaml`
-- 已运行时会避免重复拉起
+- 启动入口由 `start_loop_py_background.vbs` 间接调用 `start_loop_py_background.bat`
+- `start_loop_py_background.bat` 会自动设置 `CAMPUS_CONFIG_FILE`
+- 循环模式已内置单实例锁，重复触发不会多开
 
-## 3. 安装开机自启任务
+## 3. 安装开机自启任务（管理员，未登录也启动）
 
-以管理员身份打开 PowerShell，执行：
+以管理员身份打开终端，执行：
 
 ```powershell
-.\install_startup_task.ps1
+.\install_onstart_system.bat
 ```
 
 默认创建任务：
 
-- 任务名：`CampusLoginAutoLoop`
-- 触发器：系统启动（`AtStartup`）
-- 运行用户：`SYSTEM`
-- 运行权限：Highest
-- 运行方式：无论用户是否登录都运行
+- `CampusLoginAutoLoopPy_OnStart_SYSTEM`（系统启动触发）
+- `CampusLoginAutoLoopPy_Watchdog_SYSTEM`（每 5 分钟兜底）
 
-## 4. 任务运维
+## 4. 任务运维与校验
 
 查看任务：
 
 ```powershell
-Get-ScheduledTask -TaskName "CampusLoginAutoLoop"
+schtasks /Query /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /V /FO LIST
+schtasks /Query /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /V /FO LIST
 ```
 
-查看运行中的进程：
+手动触发验证：
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name='campus_login.exe'" |
-  Select-Object ProcessId,ExecutablePath,CommandLine
+schtasks /Run /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM"
+```
+
+查看运行中的进程（py 版）：
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like "*campus_login.py*" -and $_.CommandLine -like "*--loop*" } |
+  Select-Object ProcessId,Name,CommandLine
+```
+
+查看运行中的进程（exe 版）：
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq "campus_login.exe" } |
+  Select-Object ProcessId,Name,CommandLine
 ```
 
 删除任务：
 
 ```powershell
-Unregister-ScheduledTask -TaskName "CampusLoginAutoLoop" -Confirm:$false
+schtasks /Delete /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /F
+schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /F
 ```
 
 ## 5. 日志排障
@@ -68,4 +86,3 @@ Unregister-ScheduledTask -TaskName "CampusLoginAutoLoop" -Confirm:$false
 - `超时`
 - `TLS握手失败`
 - `未获取到 queryString`
-
