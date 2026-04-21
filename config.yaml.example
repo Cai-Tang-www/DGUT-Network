@@ -15,6 +15,10 @@ query_fetch_retry_delay: 3
 loop_interval: 20
 captive_host: "login.dgut.edu.cn"
 captive_path: "/eportal/index.jsp"
+auto_wifi_recovery: true
+wifi_ssid: "莞工全光无线"
+wifi_connect_wait: 8
+wifi_retry_interval: 60
 
 # 日志配置（后台运行建议开启文件日志）
 log_file: "./campus_login.log"

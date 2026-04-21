@@ -26,6 +26,10 @@ query_fetch_retry_delay: 3
 loop_interval: 20
 captive_host: "login.dgut.edu.cn"
 captive_path: "/eportal/index.jsp"
+auto_wifi_recovery: true
+wifi_ssid: "莞工全光无线"
+wifi_connect_wait: 8
+wifi_retry_interval: 60
 
 log_file: "./campus_login.log"
 log_level: "INFO"
@@ -49,6 +53,10 @@ log_backup_count: 3
 - `loop_interval`：循环模式检测间隔（秒）
 - `captive_host`：portal 主机名（默认从 `base_url` 推断）
 - `captive_path`：portal 登录页路径（默认 `/eportal/index.jsp`）
+- `auto_wifi_recovery`：是否启用“有线优先 + WLAN 自动恢复”
+- `wifi_ssid`：无有线时自动尝试连接的无线名称（SSID）
+- `wifi_connect_wait`：发起 WLAN 连接后等待秒数
+- `wifi_retry_interval`：WLAN 自动恢复最小重试间隔（秒）
 - `log_file`：日志文件路径（相对路径以配置文件目录为基准）
 - `log_level`：日志级别（`DEBUG`/`INFO`/`WARN`/`ERROR`）
 - `log_max_size_mb`：单日志文件最大大小（MB）
@@ -70,8 +78,11 @@ log_backup_count: 3
 - `CAMPUS_LOOP_INTERVAL`
 - `CAMPUS_CAPTIVE_HOST`
 - `CAMPUS_CAPTIVE_PATH`
+- `CAMPUS_AUTO_WIFI_RECOVERY`
+- `CAMPUS_WIFI_SSID`
+- `CAMPUS_WIFI_CONNECT_WAIT`
+- `CAMPUS_WIFI_RETRY_INTERVAL`
 - `CAMPUS_LOG_FILE`
 - `CAMPUS_LOG_LEVEL`
 - `CAMPUS_LOG_MAX_SIZE_MB`
 - `CAMPUS_LOG_BACKUP_COUNT`
-
