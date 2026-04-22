@@ -359,12 +359,18 @@ def classify_error(err):
 
 def run_cmd(args, timeout=8):
     try:
+        run_kwargs = {}
+        if os.name == "nt":
+            create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if create_no_window:
+                run_kwargs["creationflags"] = create_no_window
         proc = subprocess.run(
             args,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            **run_kwargs,
         )
         return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
     except Exception as err:
@@ -376,6 +382,10 @@ def run_powershell(script, timeout=10):
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
         timeout=timeout,
     )
+
+
+def ps_single_quote(text):
+    return str(text or "").replace("'", "''")
 
 
 def get_physical_adapters():
@@ -464,6 +474,27 @@ def get_wifi_adapter_names():
     return uniq
 
 
+def get_wlan_names_from_netsh():
+    names = []
+    code, out, _ = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=8)
+    if code != 0 or not out:
+        return names
+
+    for line in out.splitlines():
+        m = re.match(r"^\s*(?:名称|Name)\s*:\s*(.+?)\s*$", line, re.I)
+        if m:
+            n = m.group(1).strip()
+            if n:
+                names.append(n)
+    seen = set()
+    uniq = []
+    for n in names:
+        if n not in seen:
+            uniq.append(n)
+            seen.add(n)
+    return uniq
+
+
 def get_connected_wifi_ssid():
     code, out, _ = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=8)
     if code != 0 or not out:
@@ -480,11 +511,28 @@ def get_connected_wifi_ssid():
 
 
 def enable_wifi_interfaces():
+    code, _, _ = run_cmd(["sc", "start", "WlanSvc"], timeout=8)
+    if DEBUG_QUERY_FETCH:
+        log("DBG", f"WlanSvc start code={code}")
+
     names = get_wifi_adapter_names()
     if not names:
+        names = get_wlan_names_from_netsh()
+    if not names:
         names = ["Wi-Fi", "WLAN", "无线网络连接", "无线网络"]
+
     for name in names:
+        quoted = ps_single_quote(name)
+        run_powershell(
+            (
+                f"$n='{quoted}'; "
+                "try { Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop | Out-Null; exit 0 } "
+                "catch { exit 1 }"
+            ),
+            timeout=10,
+        )
         run_cmd(["netsh", "interface", "set", "interface", f"name={name}", "admin=enabled"], timeout=8)
+        run_cmd(["netsh", "wlan", "set", "autoconfig", "enabled=yes", f"interface={name}"], timeout=8)
 
 
 def add_open_wifi_profile(ssid):
@@ -516,11 +564,14 @@ def add_open_wifi_profile(ssid):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(profile_xml)
-        code, _, _ = run_cmd(
-            ["netsh", "wlan", "add", "profile", f"filename={tmp_path}", "user=current"],
-            timeout=8,
-        )
-        return code == 0
+        for scope in ("all", "current"):
+            code, _, _ = run_cmd(
+                ["netsh", "wlan", "add", "profile", f"filename={tmp_path}", f"user={scope}"],
+                timeout=8,
+            )
+            if code == 0:
+                return True
+        return False
     except Exception:
         return False
     finally:
@@ -534,12 +585,22 @@ def connect_wifi_ssid(ssid):
     if not ssid:
         return False, "SSID为空"
 
-    code, out, err = run_cmd(
-        ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"],
-        timeout=10,
-    )
-    if code != 0 and DEBUG_QUERY_FETCH:
-        log("DBG", f"netsh connect失败: {err or out}")
+    wifi_ifaces = get_wifi_adapter_names()
+    if not wifi_ifaces:
+        wifi_ifaces = [""]
+
+    last_err = ""
+    for iface in wifi_ifaces:
+        cmd = ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"]
+        if iface:
+            cmd.append(f"interface={iface}")
+        code, out, err = run_cmd(cmd, timeout=10)
+        if code == 0:
+            break
+        last_err = err or out or f"code={code}"
+    else:
+        if DEBUG_QUERY_FETCH:
+            log("DBG", f"netsh connect失败: {last_err}")
 
     time.sleep(max(1, int(WIFI_CONNECT_WAIT)))
     current = get_connected_wifi_ssid()
@@ -547,7 +608,11 @@ def connect_wifi_ssid(ssid):
         return True, current
 
     if add_open_wifi_profile(ssid):
-        run_cmd(["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"], timeout=10)
+        for iface in wifi_ifaces:
+            cmd = ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"]
+            if iface:
+                cmd.append(f"interface={iface}")
+            run_cmd(cmd, timeout=10)
         time.sleep(max(1, int(WIFI_CONNECT_WAIT)))
         current = get_connected_wifi_ssid()
         if current == ssid:
@@ -584,6 +649,12 @@ def maybe_prepare_network_link():
 
     log("INFO", f"未检测到以太网，尝试启用WLAN并连接: {WIFI_SSID}")
     enable_wifi_interfaces()
+    time.sleep(2)
+
+    if not (get_wifi_adapter_names() or get_wlan_names_from_netsh()):
+        log("WARN", "未检测到可用WLAN接口，可能处于飞行模式或硬件无线开关关闭")
+        return
+
     ok, info = connect_wifi_ssid(WIFI_SSID)
     if ok:
         log("OK", f"WLAN已连接: {info}")
@@ -1041,12 +1112,17 @@ def run_once():
     if USE_CURL_CFFI_FOR_PORTAL_HTTPS and curl_requests is None:
         log("WARN", "未安装 curl_cffi，portal HTTPS 可能握手失败")
 
-    maybe_prepare_network_link()
     client = NetClient()
 
     connected, reason = check_internet(client)
     if connected:
         log("OK", f"已联网: {reason}")
+        return
+
+    maybe_prepare_network_link()
+    connected, reason = check_internet(client, timeout=8)
+    if connected:
+        log("OK", f"WLAN恢复后已联网: {reason}")
         return
 
     log("INFO", f"未联网，开始认证: {reason}")
