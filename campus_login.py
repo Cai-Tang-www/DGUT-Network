@@ -3,10 +3,13 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 import urllib3
@@ -45,6 +48,10 @@ DEFAULTS = {
     "log_level": "INFO",
     "log_max_size_mb": 5,
     "log_backup_count": 3,
+    "auto_wifi_recovery": True,
+    "wifi_ssid": "莞工全光无线",
+    "wifi_connect_wait": 8,
+    "wifi_retry_interval": 60,
 }
 
 ENV_MAP = {
@@ -66,6 +73,10 @@ ENV_MAP = {
     "log_level": "CAMPUS_LOG_LEVEL",
     "log_max_size_mb": "CAMPUS_LOG_MAX_SIZE_MB",
     "log_backup_count": "CAMPUS_LOG_BACKUP_COUNT",
+    "auto_wifi_recovery": "CAMPUS_AUTO_WIFI_RECOVERY",
+    "wifi_ssid": "CAMPUS_WIFI_SSID",
+    "wifi_connect_wait": "CAMPUS_WIFI_CONNECT_WAIT",
+    "wifi_retry_interval": "CAMPUS_WIFI_RETRY_INTERVAL",
 }
 
 
@@ -185,6 +196,10 @@ LOG_FILE = CFG["log_file"]
 LOG_LEVEL = str(CFG["log_level"]).upper().strip() or "INFO"
 LOG_MAX_SIZE_MB = CFG["log_max_size_mb"]
 LOG_BACKUP_COUNT = CFG["log_backup_count"]
+AUTO_WIFI_RECOVERY = CFG["auto_wifi_recovery"]
+WIFI_SSID = str(CFG["wifi_ssid"] or "").strip()
+WIFI_CONNECT_WAIT = CFG["wifi_connect_wait"]
+WIFI_RETRY_INTERVAL = CFG["wifi_retry_interval"]
 CONFIG_FILE = CFG.get("_config_path", DEFAULT_CONFIG_PATH)
 
 UA = (
@@ -260,6 +275,7 @@ def setup_logger():
 
 LOGGER = setup_logger()
 SINGLE_INSTANCE_HANDLE = None
+LAST_WIFI_RECOVERY_TS = 0.0
 
 
 def log(level, msg):
@@ -339,6 +355,311 @@ def classify_error(err):
     if "handshake" in low:
         return "TLS握手失败"
     return s
+
+
+def run_cmd(args, timeout=8):
+    try:
+        run_kwargs = {}
+        if os.name == "nt":
+            create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if create_no_window:
+                run_kwargs["creationflags"] = create_no_window
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            **run_kwargs,
+        )
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except Exception as err:
+        return -1, "", short_exc(err)
+
+
+def run_powershell(script, timeout=10):
+    return run_cmd(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        timeout=timeout,
+    )
+
+
+def ps_single_quote(text):
+    return str(text or "").replace("'", "''")
+
+
+def get_physical_adapters():
+    if os.name != "nt":
+        return []
+
+    script = (
+        "$items = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { "
+        "[PSCustomObject]@{ "
+        "Name=$_.Name; "
+        "InterfaceDescription=$_.InterfaceDescription; "
+        "Status=$_.Status; "
+        "NdisPhysicalMedium=$(if ($_.PSObject.Properties.Name -contains 'NdisPhysicalMedium') { [string]$_.NdisPhysicalMedium } else { '' }); "
+        "MediaConnectionState=$(if ($_.PSObject.Properties.Name -contains 'MediaConnectionState') { [string]$_.MediaConnectionState } else { '' }) "
+        "} }; "
+        "$items | ConvertTo-Json -Compress"
+    )
+    code, out, err = run_powershell(script, timeout=12)
+    if code != 0:
+        if DEBUG_QUERY_FETCH:
+            log("DBG", f"Get-NetAdapter失败: {err}")
+        return []
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return data
+    except Exception:
+        if DEBUG_QUERY_FETCH:
+            log("DBG", "Get-NetAdapter JSON解析失败")
+    return []
+
+
+def is_ethernet_adapter(item):
+    name = str(item.get("Name", "")).lower()
+    desc = str(item.get("InterfaceDescription", "")).lower()
+    medium = str(item.get("NdisPhysicalMedium", "")).lower()
+    text = f"{name} {desc}"
+
+    if "802.3" in medium or "ethernet" in medium:
+        return True
+
+    wired_words = ("ethernet", "以太网", "lan", "gigabit", "gbe")
+    wifi_words = ("wi-fi", "wifi", "wlan", "wireless", "无线")
+    return any(w in text for w in wired_words) and not any(w in text for w in wifi_words)
+
+
+def is_wifi_adapter(item):
+    name = str(item.get("Name", "")).lower()
+    desc = str(item.get("InterfaceDescription", "")).lower()
+    medium = str(item.get("NdisPhysicalMedium", "")).lower()
+    text = f"{name} {desc}"
+    if "802.11" in medium or "wireless" in medium:
+        return True
+    return any(w in text for w in ("wi-fi", "wifi", "wlan", "无线"))
+
+
+def get_ethernet_connected_adapter():
+    adapters = get_physical_adapters()
+    for item in adapters:
+        if not is_ethernet_adapter(item):
+            continue
+        status = str(item.get("Status", "")).strip().lower()
+        media_state = str(item.get("MediaConnectionState", "")).strip().lower()
+        if status == "up" or media_state == "connected":
+            return str(item.get("Name") or item.get("InterfaceDescription") or "").strip()
+    return ""
+
+
+def get_wifi_adapter_names():
+    names = []
+    for item in get_physical_adapters():
+        if is_wifi_adapter(item):
+            name = str(item.get("Name") or "").strip()
+            if name:
+                names.append(name)
+    seen = set()
+    uniq = []
+    for name in names:
+        if name not in seen:
+            uniq.append(name)
+            seen.add(name)
+    return uniq
+
+
+def get_wlan_names_from_netsh():
+    names = []
+    code, out, _ = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=8)
+    if code != 0 or not out:
+        return names
+
+    for line in out.splitlines():
+        m = re.match(r"^\s*(?:名称|Name)\s*:\s*(.+?)\s*$", line, re.I)
+        if m:
+            n = m.group(1).strip()
+            if n:
+                names.append(n)
+    seen = set()
+    uniq = []
+    for n in names:
+        if n not in seen:
+            uniq.append(n)
+            seen.add(n)
+    return uniq
+
+
+def get_connected_wifi_ssid():
+    code, out, _ = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=8)
+    if code != 0 or not out:
+        return ""
+    for line in out.splitlines():
+        if "BSSID" in line.upper():
+            continue
+        m = re.match(r"^\s*SSID\s*:\s*(.+?)\s*$", line, re.I)
+        if m:
+            ssid = m.group(1).strip()
+            if ssid and ssid != "0":
+                return ssid
+    return ""
+
+
+def enable_wifi_interfaces():
+    code, _, _ = run_cmd(["sc", "start", "WlanSvc"], timeout=8)
+    if DEBUG_QUERY_FETCH:
+        log("DBG", f"WlanSvc start code={code}")
+
+    names = get_wifi_adapter_names()
+    if not names:
+        names = get_wlan_names_from_netsh()
+    if not names:
+        names = ["Wi-Fi", "WLAN", "无线网络连接", "无线网络"]
+
+    for name in names:
+        quoted = ps_single_quote(name)
+        run_powershell(
+            (
+                f"$n='{quoted}'; "
+                "try { Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop | Out-Null; exit 0 } "
+                "catch { exit 1 }"
+            ),
+            timeout=10,
+        )
+        run_cmd(["netsh", "interface", "set", "interface", f"name={name}", "admin=enabled"], timeout=8)
+        run_cmd(["netsh", "wlan", "set", "autoconfig", "enabled=yes", f"interface={name}"], timeout=8)
+
+
+def add_open_wifi_profile(ssid):
+    if not ssid:
+        return False
+    profile_xml = (
+        '<?xml version="1.0"?>\n'
+        '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+        f"  <name>{xml_escape(ssid)}</name>\n"
+        "  <SSIDConfig>\n"
+        "    <SSID>\n"
+        f"      <name>{xml_escape(ssid)}</name>\n"
+        "    </SSID>\n"
+        "  </SSIDConfig>\n"
+        "  <connectionType>ESS</connectionType>\n"
+        "  <connectionMode>auto</connectionMode>\n"
+        "  <MSM>\n"
+        "    <security>\n"
+        "      <authEncryption>\n"
+        "        <authentication>open</authentication>\n"
+        "        <encryption>none</encryption>\n"
+        "        <useOneX>false</useOneX>\n"
+        "      </authEncryption>\n"
+        "    </security>\n"
+        "  </MSM>\n"
+        "</WLANProfile>\n"
+    )
+    fd, tmp_path = tempfile.mkstemp(prefix="campus_wifi_", suffix=".xml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(profile_xml)
+        for scope in ("all", "current"):
+            code, _, _ = run_cmd(
+                ["netsh", "wlan", "add", "profile", f"filename={tmp_path}", f"user={scope}"],
+                timeout=8,
+            )
+            if code == 0:
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def connect_wifi_ssid(ssid):
+    if not ssid:
+        return False, "SSID为空"
+
+    wifi_ifaces = get_wifi_adapter_names()
+    if not wifi_ifaces:
+        wifi_ifaces = [""]
+
+    last_err = ""
+    for iface in wifi_ifaces:
+        cmd = ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"]
+        if iface:
+            cmd.append(f"interface={iface}")
+        code, out, err = run_cmd(cmd, timeout=10)
+        if code == 0:
+            break
+        last_err = err or out or f"code={code}"
+    else:
+        if DEBUG_QUERY_FETCH:
+            log("DBG", f"netsh connect失败: {last_err}")
+
+    time.sleep(max(1, int(WIFI_CONNECT_WAIT)))
+    current = get_connected_wifi_ssid()
+    if current == ssid:
+        return True, current
+
+    if add_open_wifi_profile(ssid):
+        for iface in wifi_ifaces:
+            cmd = ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"]
+            if iface:
+                cmd.append(f"interface={iface}")
+            run_cmd(cmd, timeout=10)
+        time.sleep(max(1, int(WIFI_CONNECT_WAIT)))
+        current = get_connected_wifi_ssid()
+        if current == ssid:
+            return True, current
+
+    return False, current or "未连上目标SSID"
+
+
+def maybe_prepare_network_link():
+    global LAST_WIFI_RECOVERY_TS
+
+    if os.name != "nt":
+        return
+    if not AUTO_WIFI_RECOVERY:
+        return
+
+    eth_name = get_ethernet_connected_adapter()
+    if eth_name:
+        log("DBG", f"检测到以太网已连接({eth_name})，跳过WLAN切换")
+        return
+
+    now = time.time()
+    if now - LAST_WIFI_RECOVERY_TS < max(1, int(WIFI_RETRY_INTERVAL)):
+        return
+    LAST_WIFI_RECOVERY_TS = now
+
+    if not WIFI_SSID:
+        log("WARN", "未配置 wifi_ssid，跳过WLAN自动连接")
+        return
+
+    current_ssid = get_connected_wifi_ssid()
+    if current_ssid == WIFI_SSID:
+        return
+
+    log("INFO", f"未检测到以太网，尝试启用WLAN并连接: {WIFI_SSID}")
+    enable_wifi_interfaces()
+    time.sleep(2)
+
+    if not (get_wifi_adapter_names() or get_wlan_names_from_netsh()):
+        log("WARN", "未检测到可用WLAN接口，可能处于飞行模式或硬件无线开关关闭")
+        return
+
+    ok, info = connect_wifi_ssid(WIFI_SSID)
+    if ok:
+        log("OK", f"WLAN已连接: {info}")
+    else:
+        log("WARN", f"WLAN连接未确认成功: {info}")
 
 
 class NetClient:
@@ -796,6 +1117,12 @@ def run_once():
     connected, reason = check_internet(client)
     if connected:
         log("OK", f"已联网: {reason}")
+        return
+
+    maybe_prepare_network_link()
+    connected, reason = check_internet(client, timeout=8)
+    if connected:
+        log("OK", f"WLAN恢复后已联网: {reason}")
         return
 
     log("INFO", f"未联网，开始认证: {reason}")

@@ -28,6 +28,8 @@
 
 - 识别 portal 劫持的联网检测（不只依赖 HTTP `200`）
 - 自动抓取当次会话 `queryString`
+- 自动检测有线网卡状态（有线优先）
+- 无有线时自动启用 WLAN 并连接指定 SSID（默认 `莞工全光无线`）
 - 自动获取 `pageInfo` 并按需执行 RSA 登录参数加密
 - 支持 YAML 配置 + 环境变量覆盖
 - 支持循环模式（`--loop`）
@@ -48,6 +50,13 @@ copy config.yaml.example config.yaml
 - `user_id`：学号/账号
 - `password`：密码
 - `base_url`：认证门户地址（DGUT 默认已内置）
+
+无线自动切换相关可选项（默认已可用）：
+
+- `auto_wifi_recovery: true`
+- `wifi_ssid: "莞工全光无线"`
+- `wifi_connect_wait: 8`
+- `wifi_retry_interval: 60`
 
 ### 2. 选择运行方式（py / exe）
 
@@ -156,6 +165,17 @@ Get-Content -Tail 80 .\runner.log
 
 该模式为“登录后启动 + 看门狗”。  
 若你已经切到 SYSTEM 模式，建议移除 Startup/HKCU 启动项，避免双触发噪音。
+
+## 自启动项是否需要更新
+
+结论：通常不需要重建任务。  
+只要计划任务里 `要运行的任务` 仍指向当前目录下的 `start_loop_py_background.vbs`（或 `campus_login.exe --loop`），脚本更新后会自动生效。
+
+需要重建任务的情况：
+
+- 部署目录改了（路径变化）
+- 从 `py` 版切换到 `exe` 版（或反向切换）
+- 任务被系统禁用、损坏或被安全策略删除
 
 ## 健康检查（不断网）
 
