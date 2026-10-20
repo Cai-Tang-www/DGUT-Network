@@ -1,0 +1,15 @@
+# Batch files must stay CRLF: cmd.exe mis-parses LF-only .bat files
+# (multi-line if blocks and goto labels break, window closes instantly).
+*.bat -text
+*.cmd -text
+
+# PowerShell is happy with either; keep CRLF for notepad friendliness.
+*.ps1 text eol=crlf
+
+# Python is happy with either; keep repo normalized.
+*.py text eol=lf
+
+# Docs
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf

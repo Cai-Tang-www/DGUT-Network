@@ -12,6 +12,7 @@ tmp_ref*/
 *.log
 *.lock
 healthcheck.log
+setup.log
 
 # Editor / agent workspace metadata
 .workbuddy/
