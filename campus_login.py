@@ -12,8 +12,26 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
-import requests
-import urllib3
+try:
+    import requests
+    import urllib3
+except ImportError as _dep_err:
+    # 依赖缺失时进程会立刻退出；pythonw 没有窗口，用户只会看到"任务存在但
+    # 没有进程、日志也没更新"。这里落一份可读的证据，便于远程排查。
+    try:
+        _crash_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "campus_login_crash.log"
+        )
+        with open(_crash_path, "a", encoding="utf-8") as _cf:
+            _cf.write(
+                "[%s] 缺少 Python 依赖: %s\n"
+                "    解释器: %s\n"
+                "    修复:   \"%s\" -m pip install requests urllib3 curl_cffi\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), _dep_err, sys.executable, sys.executable)
+            )
+    except Exception:
+        pass
+    raise
 
 try:
     from curl_cffi import requests as curl_requests

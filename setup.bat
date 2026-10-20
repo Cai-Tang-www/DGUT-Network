@@ -76,6 +76,7 @@ if errorlevel 1 (
   if errorlevel 1 (
     echo [WARN] pip install failed. Install manually:
     echo        "!PYEXE!" -m pip install requests urllib3 curl_cffi
+    echo [WARN] Without these packages campus_login.py cannot start at all.
     echo [%date% %time%] WARN pip failed>>"%LOG%"
   ) else (
     echo [%date% %time%] deps installed>>"%LOG%"

@@ -104,7 +104,8 @@ Get-Content .\campus_login.log -Tail 20
 
 | 现象 | 处理 |
 |---|---|
-| `ModuleNotFoundError: requests` | 用同一个解释器装依赖：`python -m pip install requests urllib3 curl_cffi` |
+| `ModuleNotFoundError: requests` | 用同一个解释器装依赖：`python -m pip install requests urllib3 curl_cffi`；依赖缺失时脚本会写 `campus_login_crash.log`，里面带解释器路径和修复命令 |
+| `setup.bat` 双击后窗口一闪就关 | 手动排查：开 cmd，`cd /d 解压目录`，再输 `setup.bat`，错误会留在窗口里；同时看目录下 `setup.log`（每步都有记录）。常见原因：下载到的 `.bat` 是 LF 换行（用 v0.1.1 及以上版本）|
 | 任务注册失败、提示拒绝访问 | `setup.bat` 不是以管理员身份运行的 |
 | 进程存在但日志不更新 | 看日志尾部；可能卡在 `WLAN 不可用`，检查硬件无线开关 |
 | 反复 `未联网` 但 Wi-Fi 显示已连接 | 门户认证没走通，按 README「抓不到 queryString」处理 |
