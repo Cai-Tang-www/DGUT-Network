@@ -1,88 +1,118 @@
-# Windows 部署（后台无界面）
+# Windows 部署与运维
 
-## 1. 准备文件
+## 1. 环境要求
 
-建议至少准备以下文件：
+- Windows 10 / 11
+- Python 3.9+（64 位），安装时勾选 **Add python.exe to PATH**
+- 管理员权限（仅用于注册登录自启任务，注册完成后不需要常驻管理员）
 
-- `campus_login.py` 或 `dist\campus_login.exe`
-- `config.yaml`
-- `start_loop_py_background.vbs`
-- `start_loop_py_background.bat`
+## 2. 一键部署
 
-若使用管理员 SYSTEM 开机任务，还需要：
-
-- `install_onstart_system.bat`
-
-## 2. 手动后台启动（无窗口）
-
-```powershell
-cmd /c .\start_loop_py_background.bat
+```text
+右键 setup.bat → 以管理员身份运行
 ```
 
-说明：
+脚本会依次：校验权限 → 定位 Python → 安装依赖 → 生成 `config.yaml` → 注册任务 → 启动 → 自检。
 
-- 启动入口由 `start_loop_py_background.vbs` 间接调用 `start_loop_py_background.bat`
-- `start_loop_py_background.bat` 会自动设置 `CAMPUS_CONFIG_FILE`
-- 循环模式已内置单实例锁，重复触发不会多开
+## 3. 目录约定
 
-## 3. 安装开机自启任务（管理员，未登录也启动）
+所有文件放在同一个目录（例如 `G:\校园网日志`），任务动作里写的是绝对路径，**移动目录后必须重新运行 `switch_to_logon_task.bat`**。
 
-以管理员身份打开终端，执行：
+必须存在的文件：
 
-```powershell
-.\install_onstart_system.bat
+```
+campus_login.py
+config.yaml
 ```
 
-默认创建任务：
+自启相关：
 
-- `CampusLoginAutoLoopPy_OnStart_SYSTEM`（系统启动触发）
-- `CampusLoginAutoLoopPy_Watchdog_SYSTEM`（每 5 分钟兜底）
-
-## 4. 任务运维与校验
-
-查看任务：
-
-```powershell
-schtasks /Query /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /V /FO LIST
-schtasks /Query /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /V /FO LIST
+```
+setup.bat                 （一键引导）
+setup_config.ps1          （生成配置）
+switch_to_logon_task.bat  （注册任务）
+switch_to_logon_task.ps1  （注册逻辑）
 ```
 
-手动触发验证：
+## 4. 后台启动方式
+
+任务注册后，登录时自动以 `pythonw.exe` 启动，无窗口、无控制台。
+
+手动调试（前台，能看输出）：
 
 ```powershell
-schtasks /Run /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM"
+python campus_login.py --loop
 ```
 
-查看运行中的进程（py 版）：
+手动启动/停止任务：
 
 ```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like "*campus_login.py*" -and $_.CommandLine -like "*--loop*" } |
-  Select-Object ProcessId,Name,CommandLine
+Start-ScheduledTask -TaskName "CampusLoginAutoLoopPy_Logon"
+Get-Process pythonw | Stop-Process -Force     # 下一次登录会重新拉起
 ```
 
-查看运行中的进程（exe 版）：
+## 5. 任务结构
+
+| 项目 | 值 |
+|---|---|
+| 名称 | `CampusLoginAutoLoopPy_Logon` |
+| 触发 | 当前用户登录（`AtLogOn`） |
+| 账户 | 当前用户 |
+| 级别 | `HighestAvailable`（静默提权，不弹 UAC） |
+| 动作 | `pythonw.exe "<目录>\campus_login.py" --loop` |
+| 工作目录 | 脚本所在目录 |
+| 多实例 | `IgnoreNew` |
+| 电池 | 电池上不启动；已运行实例拔电后继续跑 |
+
+不用 SYSTEM 的原因：默认禁止电池启动、进程在任务管理器中无法结束、会与其它启动项抢单实例锁。
+
+## 6. 校验是否正常
 
 ```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -eq "campus_login.exe" } |
-  Select-Object ProcessId,Name,CommandLine
+Get-ScheduledTask -TaskName "CampusLoginAutoLoopPy_Logon" | Select-Object TaskName,State,@{n='Level';e={$_.Principal.RunLevel}}
+Get-Process pythonw | Select-Object Id,StartTime
+Get-Content .\campus_login.log -Tail 20
 ```
 
-删除任务：
+正常日志：
+
+```
+循环模式启动，间隔 20s，进程PID=23380，权限=管理员
+[OK] 已联网: www.baidu.com:OK(200)
+```
+
+`权限=管理员` 说明提权生效。若显示 `普通用户`，说明进程不是任务拉起的（可能被手动启动），部分网络操作会受限。
+
+## 7. 日志
+
+- `campus_login.log`：主循环日志，默认 5 MB 轮转，保留 3 份。
+- 关键行：
+  - `已联网` — 一切正常
+  - `未联网（连续失败 N 次）` — 探测失败
+  - `WLAN 不可用（接口存在=..., 软件开关关闭=...）` — 无线电被关，正在尝试打开
+  - `WLAN已连接: <SSID> via profile=<profile名>` — 恢复成功
+  - `自动认证失败（连续 N 次）` — 认证链路有问题，按 120s×N 退避重试
+
+## 8. 脚本自更新
+
+`run_loop` 每轮比对 `campus_login.py` 和 `config.yaml` 的修改时间，发现变化就 `os.execv` 原地重载，**保留当前令牌**。所以：
+
+- 改代码 / 改配置后不必手动重启，最多等一个 `loop_interval`。
+- 重载日志：`检测到脚本或配置已更新，重载自身`。
+
+## 9. 排障
+
+| 现象 | 处理 |
+|---|---|
+| `ModuleNotFoundError: requests` | 用同一个解释器装依赖：`python -m pip install requests urllib3 curl_cffi` |
+| 任务注册失败、提示拒绝访问 | `setup.bat` 不是以管理员身份运行的 |
+| 进程存在但日志不更新 | 看日志尾部；可能卡在 `WLAN 不可用`，检查硬件无线开关 |
+| 反复 `未联网` 但 Wi-Fi 显示已连接 | 门户认证没走通，按 README「抓不到 queryString」处理 |
+| 出现两个同名 Wi-Fi | profile 的 SSID 字节编码不一致，见 README 同名网络一节 |
+
+## 10. 卸载
 
 ```powershell
-schtasks /Delete /TN "CampusLoginAutoLoopPy_OnStart_SYSTEM" /F
-schtasks /Delete /TN "CampusLoginAutoLoopPy_Watchdog_SYSTEM" /F
+Unregister-ScheduledTask -TaskName "CampusLoginAutoLoopPy_Logon" -Confirm:$false
+Remove-Item .\config.yaml, .\campus_login.log -Force
 ```
-
-## 5. 日志排障
-
-默认日志文件：`./campus_login.log`（相对 `config.yaml` 所在目录）
-
-建议重点关注：
-
-- `DNS失败`
-- `超时`
-- `TLS握手失败`
-- `未获取到 queryString`
