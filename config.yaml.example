@@ -1,26 +1,56 @@
-﻿# 复制本文件为 config.yaml 后再填写
+﻿# DGUT 校园网自动登录配置模板
+# 复制为 config.yaml 后填写。setup.bat 会自动替你生成。
+# 注意：文件必须是 UTF-8（无 BOM）；相对路径以本文件所在目录为基准。
+
+# ---- 必填 ----
 base_url: "https://login.dgut.edu.cn"
 user_id: "你的学号"
 password: "你的密码"
 
-# 可选项
+# ---- 认证 ----
+# 门户证书异常时保持 false
 verify_tls: false
+# 手动兜底 queryString（通常留空，脚本自动抓）
 captive_query_string: ""
+# 开启后会打印 queryString 抓取的调试日志
 debug_query_fetch: false
+# 有公钥时强制 RSA 加密密码
 force_rsa_encrypt: true
+# 对 portal 的 HTTPS 请求优先用 curl_cffi（绕 TLS 指纹拦截）
 use_curl_cffi: true
 curl_impersonate: "chrome124"
 query_fetch_retries: 3
 query_fetch_retry_delay: 3
-loop_interval: 20
 captive_host: "login.dgut.edu.cn"
 captive_path: "/eportal/index.jsp"
+
+# ---- 循环 ----
+# 每轮探测间隔（秒）
+loop_interval: 20
+
+# ---- WLAN 兜底 ----
+# 有线优先：检测到以太网已连接就不动 WLAN
 auto_wifi_recovery: true
 wifi_ssid: "莞工全光无线"
+# 允许匹配 Windows 重名 profile 后缀（"莞工全光无线 2"）与同前缀 SSID
+wifi_ssid_prefix_match: true
+# 连续联网失败几次才动 WLAN（loop_interval × N）
+wifi_recovery_after_fails: 2
+# 恢复成功后的冷却（秒），防止反复折腾链路
+wifi_recovery_cooldown: 300
+# 恢复失败后的重试间隔（秒），别停太久
+wifi_recovery_retry: 15
+# 机器上没有匹配 profile 时是否自动新建（写 UTF-8 hex SSID，避免造出影子网络）
+wifi_auto_add_profile: false
+# 发起连接后等待确认的秒数
 wifi_connect_wait: 8
 wifi_retry_interval: 60
 
-# 日志配置（后台运行建议开启文件日志）
+# ---- 认证退避 ----
+# 登录失败后的退避基数（秒），失败 n 次等 n×120s（上限 4 倍）
+login_fail_backoff: 120
+
+# ---- 日志 ----
 log_file: "./campus_login.log"
 log_level: "INFO"
 log_max_size_mb: 5

@@ -11,6 +11,12 @@ tmp_ref*/
 # Local runtime files
 *.log
 *.lock
+healthcheck.log
+
+# Editor / agent workspace metadata
+.workbuddy/
+.vscode/
+.idea/
 
 # Local secrets
 config.yaml

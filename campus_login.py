@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
@@ -50,8 +51,14 @@ DEFAULTS = {
     "log_backup_count": 3,
     "auto_wifi_recovery": True,
     "wifi_ssid": "莞工全光无线",
+    "wifi_ssid_prefix_match": True,
     "wifi_connect_wait": 8,
     "wifi_retry_interval": 60,
+    "wifi_recovery_after_fails": 3,
+    "wifi_recovery_cooldown": 300,
+    "wifi_recovery_retry": 15,
+    "wifi_auto_add_profile": False,
+    "login_fail_backoff": 120,
 }
 
 ENV_MAP = {
@@ -75,8 +82,14 @@ ENV_MAP = {
     "log_backup_count": "CAMPUS_LOG_BACKUP_COUNT",
     "auto_wifi_recovery": "CAMPUS_AUTO_WIFI_RECOVERY",
     "wifi_ssid": "CAMPUS_WIFI_SSID",
+    "wifi_ssid_prefix_match": "CAMPUS_WIFI_SSID_PREFIX_MATCH",
     "wifi_connect_wait": "CAMPUS_WIFI_CONNECT_WAIT",
     "wifi_retry_interval": "CAMPUS_WIFI_RETRY_INTERVAL",
+    "wifi_recovery_after_fails": "CAMPUS_WIFI_RECOVERY_AFTER_FAILS",
+    "wifi_recovery_cooldown": "CAMPUS_WIFI_RECOVERY_COOLDOWN",
+    "wifi_recovery_retry": "CAMPUS_WIFI_RECOVERY_RETRY",
+    "wifi_auto_add_profile": "CAMPUS_WIFI_AUTO_ADD_PROFILE",
+    "login_fail_backoff": "CAMPUS_LOGIN_FAIL_BACKOFF",
 }
 
 
@@ -198,8 +211,14 @@ LOG_MAX_SIZE_MB = CFG["log_max_size_mb"]
 LOG_BACKUP_COUNT = CFG["log_backup_count"]
 AUTO_WIFI_RECOVERY = CFG["auto_wifi_recovery"]
 WIFI_SSID = str(CFG["wifi_ssid"] or "").strip()
+WIFI_SSID_PREFIX_MATCH = CFG["wifi_ssid_prefix_match"]
 WIFI_CONNECT_WAIT = CFG["wifi_connect_wait"]
 WIFI_RETRY_INTERVAL = CFG["wifi_retry_interval"]
+WIFI_RECOVERY_AFTER_FAILS = CFG["wifi_recovery_after_fails"]
+WIFI_RECOVERY_COOLDOWN = CFG["wifi_recovery_cooldown"]
+WIFI_RECOVERY_RETRY = CFG["wifi_recovery_retry"]
+WIFI_AUTO_ADD_PROFILE = CFG["wifi_auto_add_profile"]
+LOGIN_FAIL_BACKOFF = CFG["login_fail_backoff"]
 CONFIG_FILE = CFG.get("_config_path", DEFAULT_CONFIG_PATH)
 
 UA = (
@@ -357,6 +376,26 @@ def classify_error(err):
     return s
 
 
+def decode_console_bytes(raw):
+    """控制台输出解码：优先 utf-8，失败回落到 mbcs(ANSI/GBK)。
+
+    netsh / powershell 的编码取决于父进程的控制台代码页：正常启动是 936(GBK)，
+    但控制台被设成 UTF-8(65001) 时会输出 utf-8。两种都要能解。
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("mbcs", errors="replace")
+    except Exception:
+        return raw.decode("latin-1", errors="replace")
+
+
 def run_cmd(args, timeout=8):
     try:
         run_kwargs = {}
@@ -367,12 +406,15 @@ def run_cmd(args, timeout=8):
         proc = subprocess.run(
             args,
             capture_output=True,
-            text=True,
             timeout=timeout,
             check=False,
             **run_kwargs,
         )
-        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+        return (
+            proc.returncode,
+            decode_console_bytes(proc.stdout).strip(),
+            decode_console_bytes(proc.stderr).strip(),
+        )
     except Exception as err:
         return -1, "", short_exc(err)
 
@@ -495,29 +537,392 @@ def get_wlan_names_from_netsh():
     return uniq
 
 
-def get_connected_wifi_ssid():
+def compact_text(text):
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = s.replace("\u3000", " ")
+    return re.sub(r"\s+", "", s).strip().lower()
+
+
+def parse_netsh_interfaces(out):
+    ifaces = []
+    cur = None
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ":" in line:
+            key, val = line.split(":", 1)
+        elif "：" in line:
+            key, val = line.split("：", 1)
+        else:
+            continue
+        k = key.strip().lower()
+        v = val.strip()
+
+        if k in ("名称", "name", "接口名称", "interface name"):
+            cur = {"name": v, "state": "", "ssid": "", "profile": "", "bssid": "", "signal": ""}
+            ifaces.append(cur)
+            continue
+        if cur is None:
+            continue
+        if "bssid" in k:
+            cur["bssid"] = v
+            continue
+        if k in ("状态", "state"):
+            cur["state"] = v
+            continue
+        if k == "ssid":
+            cur["ssid"] = v
+            continue
+        if k in ("配置文件", "profile"):
+            cur["profile"] = v
+            continue
+        if k in ("信号", "signal"):
+            cur["signal"] = v
+    return ifaces
+
+
+def is_wlan_state_connected(state):
+    s = str(state or "").strip().lower()
+    if not s:
+        return False
+    if "断开" in s or "disconnect" in s:
+        return False
+    return ("已连接" in s) or ("connected" in s)
+
+
+def get_wlan_interfaces():
+    if os.name != "nt":
+        return []
     code, out, _ = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=8)
     if code != 0 or not out:
-        return ""
-    for line in out.splitlines():
-        if "BSSID" in line.upper():
+        return []
+    return parse_netsh_interfaces(out)
+
+
+def ssid_matches(ssid, target=None):
+    """目标 SSID 匹配：忽略空白/全半角，允许 Windows 重名后缀（" 2"）与可选前缀匹配。"""
+    if not ssid:
+        return False
+    target = WIFI_SSID if target is None else target
+    if not target:
+        return False
+
+    got = compact_text(ssid)
+    if not got:
+        return False
+
+    for part in re.split(r"[,;|]", str(target)):
+        want = compact_text(part)
+        if not want:
             continue
-        m = re.match(r"^\s*SSID\s*:\s*(.+?)\s*$", line, re.I)
-        if m:
-            ssid = m.group(1).strip()
+        if got == want:
+            return True
+        # Windows 给重名 profile 自动加 " 2" / " 3" 后缀
+        if re.fullmatch(re.escape(want) + r"\d{1,2}", got):
+            return True
+        if WIFI_SSID_PREFIX_MATCH and got.startswith(want):
+            return True
+    return False
+
+
+def get_connected_wifi_ssid():
+    for item in get_wlan_interfaces():
+        if is_wlan_state_connected(item.get("state")):
+            ssid = str(item.get("ssid") or "").strip()
             if ssid and ssid != "0":
                 return ssid
     return ""
 
 
-def enable_wifi_interfaces():
-    code, _, _ = run_cmd(["sc", "start", "WlanSvc"], timeout=8)
-    if DEBUG_QUERY_FETCH:
-        log("DBG", f"WlanSvc start code={code}")
+def get_connected_wlan():
+    for item in get_wlan_interfaces():
+        if is_wlan_state_connected(item.get("state")):
+            return item
+    return {}
+
+
+def list_wlan_profiles():
+    code, out, _ = run_cmd(["netsh", "wlan", "show", "profiles"], timeout=8)
+    if code != 0 or not out:
+        return []
+    names = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*(?:所有用户配置文件|All User Profile|当前用户配置文件|User Profile)\s*:\s*(.+?)\s*$", line, re.I)
+        if m:
+            name = m.group(1).strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def wifi_state_path():
+    base = os.path.dirname(os.path.abspath(CONFIG_FILE)) if CONFIG_FILE else APP_DIR
+    return os.path.join(base or APP_DIR, "wifi_state.json")
+
+
+def load_wifi_state():
+    try:
+        with open(wifi_state_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("last_good", "")
+                data.setdefault("bad", [])
+                return data
+    except Exception:
+        pass
+    return {"last_good": "", "bad": []}
+
+
+def save_wifi_state(state):
+    try:
+        path = wifi_state_path()
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as err:
+        log("DBG", f"wifi_state 写入失败: {short_exc(err)}")
+
+
+def wifi_profile_candidates():
+    """返回可用 profile 名，优先上次成功的、跳过已知失败的。"""
+    state = load_wifi_state()
+    names = [n for n in list_wlan_profiles() if ssid_matches(n)]
+    last_good = state.get("last_good", "")
+    if last_good not in names:
+        # 自动学习：当前正在用的 profile 就是最可靠的候选
+        cur_profile = str((get_connected_wlan() or {}).get("profile") or "").strip()
+        if cur_profile in names:
+            last_good = cur_profile
+        else:
+            last_good = ""
+    bad = set(state.get("bad") or [])
+
+    head = [last_good] if last_good and last_good in names else []
+    rest = [n for n in names if n not in head and n not in bad]
+    tail = [n for n in names if n not in head and n in bad]
+    return head + rest, head + rest + tail
+
+
+
+def is_admin():
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def wlan_radio_software_off():
+    """探测 netsh 里的「无线电状态: 软件 关」（WLAN 开关被关掉）。"""
+    code, out, _ = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=8)
+    if code != 0 or not out:
+        return False
+    for line in out.splitlines():
+        s = line.strip()
+        if "软件" in s and "关" in s and "开" not in s.replace("开关", ""):
+            return True
+        low = s.lower()
+        if "software" in low and "off" in low:
+            return True
+    return False
+
+
+def force_wlan_radio_on_via_wlanapi():
+    """用 wlanapi 的 WlanSetInterface(wlan_intf_opcode_radio_state) 打开软件无线电。
+
+    这是 Windows 设置里那个 WLAN 开关走的同一条路径。实测：netsh wlan set
+    autoconfig、Disable/Enable-NetAdapter 都改不动这个状态。需要管理员权限。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception as err:
+        log("WARN", f"ctypes 不可用: {short_exc(err)}")
+        return False
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class WLAN_INTERFACE_INFO(ctypes.Structure):
+        _fields_ = [
+            ("InterfaceGuid", GUID),
+            ("strInterfaceDescription", wintypes.WCHAR * 256),
+            ("isState", wintypes.DWORD),
+        ]
+
+    class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+        _fields_ = [
+            ("dwNumberOfItems", wintypes.DWORD),
+            ("dwIndex", wintypes.DWORD),
+            ("InterfaceInfo", WLAN_INTERFACE_INFO * 8),
+        ]
+
+    class WLAN_PHY_RADIO_STATE(ctypes.Structure):
+        _fields_ = [
+            ("dwPhyIndex", wintypes.DWORD),
+            ("SoftwareRadioState", wintypes.DWORD),
+            ("HardwareRadioState", wintypes.DWORD),
+        ]
+
+    OPCODE_RADIO_STATE = 4
+    RADIO_HW_SOFT_ON = 1
+    ERROR_SUCCESS = 0
+
+    try:
+        wlanapi = ctypes.WinDLL("wlanapi.dll")
+    except Exception as err:
+        log("WARN", f"加载 wlanapi.dll 失败: {short_exc(err)}")
+        return False
+
+    handle = wintypes.HANDLE()
+    negotiated = wintypes.DWORD()
+    rc = wlanapi.WlanOpenHandle(2, None, ctypes.byref(negotiated), ctypes.byref(handle))
+    if rc != ERROR_SUCCESS:
+        log("WARN", f"WlanOpenHandle 失败 rc={rc}")
+        return False
+
+    ok = False
+    plist = ctypes.c_void_p()
+    try:
+        rc = wlanapi.WlanEnumInterfaces(handle, None, ctypes.byref(plist))
+        if rc != ERROR_SUCCESS or not plist:
+            log("WARN", f"WlanEnumInterfaces 失败 rc={rc}")
+            return False
+        lst = ctypes.cast(plist, ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)).contents
+        if lst.dwNumberOfItems < 1:
+            log("WARN", "WlanEnumInterfaces 返回 0 个无线接口")
+            return False
+        guid = lst.InterfaceInfo[0].InterfaceGuid
+
+        size = wintypes.DWORD()
+        data = ctypes.c_void_p()
+        opcode_type = wintypes.DWORD()
+        rc = wlanapi.WlanQueryInterface(
+            handle,
+            ctypes.byref(guid),
+            OPCODE_RADIO_STATE,
+            None,
+            ctypes.byref(size),
+            ctypes.byref(data),
+            ctypes.byref(opcode_type),
+        )
+        if rc != ERROR_SUCCESS or not data:
+            log("WARN", f"WlanQueryInterface 失败 rc={rc}")
+            return False
+
+        try:
+            if size.value < ctypes.sizeof(WLAN_PHY_RADIO_STATE):
+                log("WARN", f"radio_state 结构大小异常 size={size.value}")
+                return False
+            cur = ctypes.cast(data, ctypes.POINTER(WLAN_PHY_RADIO_STATE)).contents
+            hw_state = cur.HardwareRadioState
+        finally:
+            wlanapi.WlanFreeMemory(data)
+
+        new_state = WLAN_PHY_RADIO_STATE()
+        new_state.dwPhyIndex = 0
+        new_state.SoftwareRadioState = RADIO_HW_SOFT_ON
+        new_state.HardwareRadioState = hw_state
+        rc = wlanapi.WlanSetInterface(
+            handle,
+            ctypes.byref(guid),
+            OPCODE_RADIO_STATE,
+            ctypes.sizeof(new_state),
+            ctypes.byref(new_state),
+            None,
+        )
+        if rc == ERROR_SUCCESS:
+            ok = True
+            log("OK", "已通过 wlanapi 下发无线电开启指令")
+        else:
+            log("WARN", f"WlanSetInterface 失败 rc={rc}（5=拒绝访问 87=参数错误 1168=元素未找到）")
+    finally:
+        if plist:
+            try:
+                wlanapi.WlanFreeMemory(plist)
+            except Exception:
+                pass
+        try:
+            wlanapi.WlanCloseHandle(handle, None)
+        except Exception:
+            pass
+    return ok
+
+
+def force_enable_wlan_radio():
+    """把「无线电状态: 软件 关」翻回「开」。
+
+    三级：① wlanapi（设置页同款 API，实测无需管理员即可生效）
+          ② netsh autoconfig ③ 重置适配器（②③ 需要管理员）。
+    """
+    names = get_wifi_adapter_names() or get_wlan_names_from_netsh() or ["WLAN"]
+
+    if force_wlan_radio_on_via_wlanapi():
+        time.sleep(2)
+        if not wlan_radio_software_off():
+            log("OK", "WLAN 无线电软件开关已打开（wlanapi）")
+            return True
+        # netsh 状态可能滞后：wlanapi 报成功就先放行，让后续 connect 去验证
+        log("INFO", "wlanapi 已上报成功，但 netsh 仍显示软件关，继续尝试连接")
+        return True
+
+    if not is_admin():
+        log("WARN", "非管理员：跳过需要提权的兜底方法（netsh autoconfig / 重置适配器）")
+        return False
+
+    for name in names:
+        run_cmd(["netsh", "wlan", "set", "autoconfig", "enabled=yes", f"interface={name}"], timeout=10)
+    time.sleep(1.5)
+    if not wlan_radio_software_off():
+        log("OK", "WLAN 无线电软件开关已打开（autoconfig）")
+        return True
+
+    for name in names:
+        quoted = ps_single_quote(name)
+        run_powershell(
+            (
+                f"$n='{quoted}'; "
+                "try { Disable-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue } catch {}; "
+                "Start-Sleep -Seconds 3; "
+                "try { Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue } catch {}"
+            ),
+            timeout=40,
+        )
+    time.sleep(4)
+    if not wlan_radio_software_off():
+        log("OK", "WLAN 无线电软件开关已打开（重置适配器）")
+        return True
+
+    log("WARN", "尝试打开 WLAN 无线电失败（可能被硬件开关或组策略锁住）")
+    return False
+
+
+def enable_wifi_interfaces(force=False):
+    """只在接口确实被禁用时才启用它，避免反复 reset 掉正常的链路。"""
+    run_cmd(["sc", "start", "WlanSvc"], timeout=8)
 
     names = get_wifi_adapter_names()
     if not names:
         names = get_wlan_names_from_netsh()
+
+    for name in names:
+        run_cmd(["netsh", "wlan", "set", "autoconfig", "enabled=yes", f"interface={name}"], timeout=8)
+
+    if not force:
+        return
+
     if not names:
         names = ["Wi-Fi", "WLAN", "无线网络连接", "无线网络"]
 
@@ -526,26 +931,38 @@ def enable_wifi_interfaces():
         run_powershell(
             (
                 f"$n='{quoted}'; "
-                "try { Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop | Out-Null; exit 0 } "
-                "catch { exit 1 }"
+                "$a = Get-NetAdapter -Name $n -ErrorAction SilentlyContinue; "
+                "if ($a -and $a.Status -eq 'Disabled') { "
+                "  try { Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop | Out-Null; exit 0 } "
+                "  catch { exit 1 } "
+                "} else { exit 0 }"
             ),
             timeout=10,
         )
-        run_cmd(["netsh", "interface", "set", "interface", f"name={name}", "admin=enabled"], timeout=8)
-        run_cmd(["netsh", "wlan", "set", "autoconfig", "enabled=yes", f"interface={name}"], timeout=8)
+
 
 
 def add_open_wifi_profile(ssid):
+    """写入开放网络 profile。
+
+    注意：不要用 <name> 让 netsh 自己转编码——中文 SSID 会被按 ANSI(GBK) 写进
+    802.11 SSID 字段，造出一个空气里不存在的"影子 SSID"，connect 必然失败。
+    这里显式给出 UTF-8 字节的 <hex>，与 AP 广播字节保持一致。
+    """
     if not ssid:
         return False
+
+    hex_ssid = ssid.encode("utf-8").hex().upper()
     profile_xml = (
         '<?xml version="1.0"?>\n'
         '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
         f"  <name>{xml_escape(ssid)}</name>\n"
         "  <SSIDConfig>\n"
         "    <SSID>\n"
+        f"      <hex>{hex_ssid}</hex>\n"
         f"      <name>{xml_escape(ssid)}</name>\n"
         "    </SSID>\n"
+        "    <nonBroadcast>false</nonBroadcast>\n"
         "  </SSIDConfig>\n"
         "  <connectionType>ESS</connectionType>\n"
         "  <connectionMode>auto</connectionMode>\n"
@@ -564,15 +981,19 @@ def add_open_wifi_profile(ssid):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(profile_xml)
-        for scope in ("all", "current"):
-            code, _, _ = run_cmd(
+        for scope in ("current", "all"):
+            code, _, err = run_cmd(
                 ["netsh", "wlan", "add", "profile", f"filename={tmp_path}", f"user={scope}"],
                 timeout=8,
             )
             if code == 0:
+                log("INFO", f"已写入 WLAN profile: {ssid} (scope={scope}, ssid_bytes_hex={hex_ssid})")
                 return True
+            if DEBUG_QUERY_FETCH:
+                log("DBG", f"add profile scope={scope} 失败: {err}")
         return False
-    except Exception:
+    except Exception as err:
+        log("WARN", f"写入 profile 失败: {short_exc(err)}")
         return False
     finally:
         try:
@@ -581,85 +1002,154 @@ def add_open_wifi_profile(ssid):
             pass
 
 
-def connect_wifi_ssid(ssid):
-    if not ssid:
+def wait_for_wlan_connection(timeout):
+    deadline = time.time() + max(1, timeout)
+    while time.time() < deadline:
+        item = get_connected_wlan()
+        if item and ssid_matches(item.get("ssid")):
+            return True, item
+        time.sleep(1.0)
+    return False, get_connected_wlan()
+
+
+def connect_wifi_ssid(ssid=None, force=False):
+    """确保 WLAN 连到目标 SSID。
+
+    force=False 时只要当前已连到目标 SSID 就什么都不做——绝不对健康链路
+    调 netsh wlan connect（那会先断开现有连接）。
+    """
+    target = (ssid or WIFI_SSID or "").strip()
+    if not target:
         return False, "SSID为空"
 
-    wifi_ifaces = get_wifi_adapter_names()
-    if not wifi_ifaces:
-        wifi_ifaces = [""]
+    current = get_connected_wlan()
+    if current and ssid_matches(current.get("ssid"), target):
+        if not force:
+            return True, current.get("ssid", "")
+        # force 场景下也不重复连接同一 profile
+        return True, current.get("ssid", "")
+
+    ifaces = get_wifi_adapter_names() or [""]
+    iface = ifaces[0] if ifaces else ""
+
+    tried, all_candidates = wifi_profile_candidates()
+    if not all_candidates and WIFI_AUTO_ADD_PROFILE:
+        if add_open_wifi_profile(target):
+            tried = [target]
+
+    if not tried:
+        log("WARN", f"没有找到与 {target} 匹配的 WLAN profile（wifi_auto_add_profile=false）")
+        return False, f"无可用 profile: {target}"
+
+    state = load_wifi_state()
+    bad = set(state.get("bad") or [])
 
     last_err = ""
-    for iface in wifi_ifaces:
-        cmd = ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"]
+    for name in tried:
+        cmd = ["netsh", "wlan", "connect", f"name={name}"]
         if iface:
             cmd.append(f"interface={iface}")
-        code, out, err = run_cmd(cmd, timeout=10)
-        if code == 0:
-            break
-        last_err = err or out or f"code={code}"
-    else:
-        if DEBUG_QUERY_FETCH:
-            log("DBG", f"netsh connect失败: {last_err}")
+        run_cmd(cmd, timeout=10)
+        ok, item = wait_for_wlan_connection(WIFI_CONNECT_WAIT)
+        if ok:
+            state["last_good"] = name
+            state["bad"] = sorted(bad - {name})
+            save_wifi_state(state)
+            return True, f"{item.get('ssid')} via profile={name}"
+        last_err = f"profile={name} 未连上"
 
-    time.sleep(max(1, int(WIFI_CONNECT_WAIT)))
-    current = get_connected_wifi_ssid()
-    if current == ssid:
-        return True, current
-
-    if add_open_wifi_profile(ssid):
-        for iface in wifi_ifaces:
-            cmd = ["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"]
-            if iface:
-                cmd.append(f"interface={iface}")
-            run_cmd(cmd, timeout=10)
-        time.sleep(max(1, int(WIFI_CONNECT_WAIT)))
-        current = get_connected_wifi_ssid()
-        if current == ssid:
-            return True, current
-
-    return False, current or "未连上目标SSID"
+    # 全部失败：把所有候选记为可疑，下次换序重试
+    state["bad"] = sorted(bad | set(tried))
+    save_wifi_state(state)
+    now = get_connected_wlan()
+    return False, f"{last_err}（当前: {now.get('ssid') or '未连接'}）"
 
 
-def maybe_prepare_network_link():
+
+def _recovery_cooldown():
+    """成功恢复后的冷却时长（防抖，避免反复折腾链路）。"""
+    return max(1, int(WIFI_RETRY_INTERVAL), int(WIFI_RECOVERY_COOLDOWN))
+
+
+def maybe_prepare_network_link(fail_streak=0):
+    """联网失败时的 WLAN 兜底。
+
+    三层保护，避免把一条本来正常的链路折腾断：
+      1) 只要已连到目标 SSID（含 " 2" 之类的重名 profile），直接返回，绝不 connect；
+      2) 连续失败次数不足 wifi_recovery_after_fails 时不动手（去抖，滤掉漫游抖动）；
+      3) 两次动手之间至少间隔 wifi_recovery_cooldown 秒。
+    """
     global LAST_WIFI_RECOVERY_TS
 
     if os.name != "nt":
-        return
+        return False
     if not AUTO_WIFI_RECOVERY:
-        return
+        return False
 
     eth_name = get_ethernet_connected_adapter()
     if eth_name:
         log("DBG", f"检测到以太网已连接({eth_name})，跳过WLAN切换")
-        return
-
-    now = time.time()
-    if now - LAST_WIFI_RECOVERY_TS < max(1, int(WIFI_RETRY_INTERVAL)):
-        return
-    LAST_WIFI_RECOVERY_TS = now
+        return False
 
     if not WIFI_SSID:
         log("WARN", "未配置 wifi_ssid，跳过WLAN自动连接")
-        return
+        return False
 
-    current_ssid = get_connected_wifi_ssid()
-    if current_ssid == WIFI_SSID:
-        return
+    for item in get_wlan_interfaces():
+        if is_wlan_state_connected(item.get("state")) and ssid_matches(item.get("ssid")):
+            return False
 
-    log("INFO", f"未检测到以太网，尝试启用WLAN并连接: {WIFI_SSID}")
-    enable_wifi_interfaces()
+    need = max(1, int(WIFI_RECOVERY_AFTER_FAILS))
+    if fail_streak < need:
+        log("DBG", f"WLAN未连到目标，但连续失败{fail_streak}/{need}，暂不干预")
+        return False
+
+    cooldown = _recovery_cooldown()
+    now = time.time()
+    if now - LAST_WIFI_RECOVERY_TS < cooldown:
+        log("DBG", f"WLAN恢复冷却中（{int(cooldown - (now - LAST_WIFI_RECOVERY_TS))}s）")
+        return False
+    LAST_WIFI_RECOVERY_TS = now
+
+    current = get_connected_wlan()
+    if current:
+        log("INFO", f"当前WLAN: {current.get('ssid') or '?'}，目标: {WIFI_SSID}，尝试切换")
+    else:
+        log("INFO", f"WLAN未连接，尝试连接: {WIFI_SSID}")
+
+    enable_wifi_interfaces(force=True)
     time.sleep(2)
 
-    if not (get_wifi_adapter_names() or get_wlan_names_from_netsh()):
-        log("WARN", "未检测到可用WLAN接口，可能处于飞行模式或硬件无线开关关闭")
-        return
+    has_iface = bool(get_wifi_adapter_names() or get_wlan_names_from_netsh())
+    radio_off = wlan_radio_software_off()
+    if (not has_iface) or radio_off:
+        log("INFO", f"WLAN 不可用（接口存在={has_iface}, 软件开关关闭={radio_off}），尝试恢复")
+        if is_admin():
+            forced = force_enable_wlan_radio()
+            time.sleep(2)
+            has_iface = bool(get_wifi_adapter_names() or get_wlan_names_from_netsh())
+            radio_off = wlan_radio_software_off()
+            if forced and radio_off:
+                # wlanapi 已下发成功，netsh 可能滞后，放行去连
+                radio_off = False
+        else:
+            log("WARN", "非管理员权限，无法程序化打开 WLAN 开关；请手动打开，或让脚本以管理员计划任务运行")
+
+    if (not has_iface) or radio_off:
+        log("WARN", f"WLAN 仍不可用：接口存在={has_iface} 软件开关关闭={radio_off}，{WIFI_RECOVERY_RETRY}s 后重试")
+        LAST_WIFI_RECOVERY_TS = time.time() - _recovery_cooldown() + max(10, int(WIFI_RECOVERY_RETRY))
+        return False
 
     ok, info = connect_wifi_ssid(WIFI_SSID)
     if ok:
+        LAST_WIFI_RECOVERY_TS = time.time()
         log("OK", f"WLAN已连接: {info}")
-    else:
-        log("WARN", f"WLAN连接未确认成功: {info}")
+        return True
+
+    LAST_WIFI_RECOVERY_TS = time.time() - _recovery_cooldown() + max(10, int(WIFI_RECOVERY_RETRY))
+    log("WARN", f"WLAN连接未确认成功: {info}，{WIFI_RECOVERY_RETRY}s 后重试")
+    return False
+
 
 
 class NetClient:
@@ -1108,7 +1598,14 @@ def login_campus_network(client):
     return ok
 
 
+INTERNET_FAIL_STREAK = 0
+LOGIN_FAIL_STREAK = 0
+LOGIN_FAIL_TS = 0.0
+
+
 def run_once():
+    global INTERNET_FAIL_STREAK, LOGIN_FAIL_STREAK, LOGIN_FAIL_TS
+
     if USE_CURL_CFFI_FOR_PORTAL_HTTPS and curl_requests is None:
         log("WARN", "未安装 curl_cffi，portal HTTPS 可能握手失败")
 
@@ -1116,29 +1613,95 @@ def run_once():
 
     connected, reason = check_internet(client)
     if connected:
-        log("OK", f"已联网: {reason}")
+        if INTERNET_FAIL_STREAK:
+            log("OK", f"网络已恢复（此前连续失败 {INTERNET_FAIL_STREAK} 次）: {reason}")
+        else:
+            log("OK", f"已联网: {reason}")
+        INTERNET_FAIL_STREAK = 0
+        LOGIN_FAIL_STREAK = 0
         return
 
-    maybe_prepare_network_link()
-    connected, reason = check_internet(client, timeout=8)
-    if connected:
-        log("OK", f"WLAN恢复后已联网: {reason}")
+    INTERNET_FAIL_STREAK += 1
+
+    recovered = maybe_prepare_network_link(INTERNET_FAIL_STREAK)
+    if recovered:
+        connected, reason = check_internet(client, timeout=8)
+        if connected:
+            INTERNET_FAIL_STREAK = 0
+            log("OK", f"WLAN恢复后已联网: {reason}")
+            return
+
+    # 连链路都没有时，认证必然失败，不必空跑抓 queryString
+    if not get_ethernet_connected_adapter() and not get_connected_wlan():
+        log("WARN", "当前无可用链路（以太网未连接、WLAN未连上），本轮跳过认证")
         return
 
-    log("INFO", f"未联网，开始认证: {reason}")
+    backoff = max(0, int(LOGIN_FAIL_BACKOFF))
+    if backoff and LOGIN_FAIL_STREAK:
+        wait_left = backoff * min(LOGIN_FAIL_STREAK, 4) - (time.time() - LOGIN_FAIL_TS)
+        if wait_left > 0:
+            log("DBG", f"认证退避中（连续失败 {LOGIN_FAIL_STREAK} 次，{int(wait_left)}s 后重试）")
+            return
+
+    log("INFO", f"未联网（连续失败 {INTERNET_FAIL_STREAK} 次），开始认证: {reason}")
     success = login_campus_network(client)
-    if not success:
-        log("ERR", "自动认证失败")
+    if success:
+        INTERNET_FAIL_STREAK = 0
+        LOGIN_FAIL_STREAK = 0
+    else:
+        LOGIN_FAIL_STREAK += 1
+        LOGIN_FAIL_TS = time.time()
+        log("ERR", f"自动认证失败（连续 {LOGIN_FAIL_STREAK} 次）")
+
+
+
+def _script_mtime():
+    """脚本或配置被改动的最近时间，用于自动重载。"""
+    newest = 0.0
+    try:
+        newest = os.path.getmtime(os.path.abspath(__file__))
+    except Exception:
+        pass
+    try:
+        if CONFIG_FILE and os.path.exists(CONFIG_FILE):
+            newest = max(newest, os.path.getmtime(CONFIG_FILE))
+    except Exception:
+        pass
+    return newest
 
 
 def run_loop(interval):
-    log("INFO", f"循环模式启动，间隔 {interval}s")
+    log(
+        "INFO",
+        f"循环模式启动，间隔 {interval}s，进程PID={os.getpid()}，"
+        f"权限={'管理员' if is_admin() else '普通用户（无法启停网卡/打开WLAN开关）'}",
+    )
+    start_mtime = _script_mtime()
     while True:
         try:
             run_once()
         except Exception as err:
             log("ERR", f"循环异常: {short_exc(err)}")
         time.sleep(interval)
+
+        # 脚本被改动就原地重载：继承当前令牌（管理员身份不会丢），省得手工重启
+        now_mtime = _script_mtime()
+        if now_mtime and now_mtime != start_mtime:
+            log("INFO", "检测到脚本或配置已更新，重载自身")
+            try:
+                if SINGLE_INSTANCE_HANDLE is not None:
+                    SINGLE_INSTANCE_HANDLE.close()
+            except Exception:
+                pass
+            try:
+                os.execv(
+                    sys.executable,
+                    [sys.executable, os.path.abspath(__file__), "--loop", "--interval", str(interval)],
+                )
+                return
+            except Exception as err:
+                log("ERR", f"自载失败，继续用旧代码运行: {short_exc(err)}")
+                start_mtime = now_mtime
 
 
 def parse_interval(argv):
