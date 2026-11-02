@@ -125,7 +125,8 @@ exit /b 4
 rem ---------------- 4) scheduled task ----------------
 :install_task
 echo.
-echo [..] registering logon task (elevated, current user) ...
+echo [..] registering logon task and migrating legacy autostart ...
+echo      (old SYSTEM tasks / HKCU Run key are removed in this step)
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0switch_to_logon_task.ps1"
 if errorlevel 1 (
   echo.

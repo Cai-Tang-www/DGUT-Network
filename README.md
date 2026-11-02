@@ -105,6 +105,34 @@ Unregister-ScheduledTask -TaskName "CampusLoginAutoLoopPy_Logon" -Confirm:$false
 
 再删掉 `config.yaml`、`campus_login.log` 即可，不留其他痕迹。
 
+## 从旧版升级（v0.0.x → v0.1.x）
+
+旧版会在系统里留下这些自启痕迹，新版一个都不需要：
+
+| 残留 | 来源 |
+|---|---|
+| `CampusLoginAutoLoopPy_OnStart_SYSTEM` | 旧版 `install_onstart_system.bat` 建的开机任务 |
+| `CampusLoginAutoLoopPy_Watchdog_SYSTEM` | 旧版的 5 分钟守护任务 |
+| `CampusLoginAutoLoopPy` / `_OnStart` / `_OnLogon` / `_Watchdog` | 更早的变体，名字相近一并清 |
+| `HKCU\...\Run\CampusLoginAutoStart` | 旧版的注册表启动项 |
+| `start_loop_py_background.vbs` / `.bat` | 旧版的启动壳，新版任务直接起 `pythonw` |
+
+升级步骤：把新版解压到**原目录**（任务里写的是绝对路径），然后
+
+```text
+右键 setup.bat → 以管理员身份运行
+```
+
+`config.yaml` 已经存在时会问 `Reconfigure it? [y/N]`，直接回车保留原配置。脚本接着会：
+
+1. 注册新任务 `CampusLoginAutoLoopPy_Logon`
+2. 删除上表所有残留（含 TaskCache 里没有对应 XML 的孤儿键）
+3. 结束旧进程，用新任务重新拉起
+
+顺序是**先建后删**：只有新任务确认写盘才会动旧的，中途失败不会出现"旧任务删了、新任务没装上"的空窗。
+
+只想重新注册任务、不动配置的话，也可以单独跑 `switch_to_logon_task.bat`（同样需要管理员）。
+
 ## 配置
 
 见 [`docs/CONFIG.md`](./docs/CONFIG.md)。最小可用配置只有三项：
