@@ -29,8 +29,17 @@ rem only opens Microsoft Store and returns an error, which looks like a crash.
 set "PYEXE="
 set "PYWEXE="
 
-if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"  set "PYEXE=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-if exist "%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe" set "PYWEXE=%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"
+rem Pick the newest %LOCALAPPDATA%\Programs\Python\Python3XX install.
+rem dir /o-n sorts names descending, so Python313 wins over Python312.
+set "PYROOT=%LOCALAPPDATA%\Programs\Python"
+if exist "%PYROOT%" (
+  for /f "delims=" %%D in ('dir /b /ad /o-n "%PYROOT%\Python3*" 2^>nul') do (
+    if not defined PYEXE if exist "%PYROOT%\%%D\python.exe" (
+      set "PYEXE=%PYROOT%\%%D\python.exe"
+      if exist "%PYROOT%\%%D\pythonw.exe" set "PYWEXE=%PYROOT%\%%D\pythonw.exe"
+    )
+  )
+)
 
 if not defined PYEXE (
   for /f "delims=" %%I in ('where python 2^>nul') do (

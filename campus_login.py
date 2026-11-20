@@ -75,7 +75,8 @@ DEFAULTS = {
     "wifi_recovery_after_fails": 3,
     "wifi_recovery_cooldown": 300,
     "wifi_recovery_retry": 15,
-    "wifi_auto_add_profile": False,
+    "wifi_auto_add_profile": True,
+    "auto_route_cleanup": True,
     "login_fail_backoff": 120,
 }
 
@@ -107,6 +108,7 @@ ENV_MAP = {
     "wifi_recovery_cooldown": "CAMPUS_WIFI_RECOVERY_COOLDOWN",
     "wifi_recovery_retry": "CAMPUS_WIFI_RECOVERY_RETRY",
     "wifi_auto_add_profile": "CAMPUS_WIFI_AUTO_ADD_PROFILE",
+    "auto_route_cleanup": "CAMPUS_AUTO_ROUTE_CLEANUP",
     "login_fail_backoff": "CAMPUS_LOGIN_FAIL_BACKOFF",
 }
 
@@ -236,6 +238,7 @@ WIFI_RECOVERY_AFTER_FAILS = CFG["wifi_recovery_after_fails"]
 WIFI_RECOVERY_COOLDOWN = CFG["wifi_recovery_cooldown"]
 WIFI_RECOVERY_RETRY = CFG["wifi_recovery_retry"]
 WIFI_AUTO_ADD_PROFILE = CFG["wifi_auto_add_profile"]
+AUTO_ROUTE_CLEANUP = CFG["auto_route_cleanup"]
 LOGIN_FAIL_BACKOFF = CFG["login_fail_backoff"]
 CONFIG_FILE = CFG.get("_config_path", DEFAULT_CONFIG_PATH)
 
@@ -927,6 +930,57 @@ def force_enable_wlan_radio():
     return False
 
 
+LAST_ROUTE_CLEANUP_TS = 0.0
+ROUTE_CLEANUP_INTERVAL = 30
+
+
+def cleanup_stale_default_routes(force=False):
+    """删掉「网卡已断开却仍保留」的默认路由。
+
+    拔掉网线后 Windows 常见行为：接口状态变成 Disconnected，但 DHCP 地址和
+    默认路由都还在；而以太网的 InterfaceMetric（通常 25）比 Wi-Fi（通常 45）
+    更低，于是新连接优先选这条死路，SYN 无人应答，等约 21 秒 TCP 超时才回退
+    到 Wi-Fi —— 表现就是「点开网页黑屏 20 秒然后突然加载」。
+
+    只删「接口状态不是 Up」的默认路由，正在用的链路不受影响；插回网线后
+    DHCP 会重新安装路由。需要管理员权限。
+    """
+    global LAST_ROUTE_CLEANUP_TS
+
+    if os.name != "nt":
+        return False
+    if not AUTO_ROUTE_CLEANUP:
+        return False
+    if not is_admin():
+        return False
+
+    now = time.time()
+    if not force and now - LAST_ROUTE_CLEANUP_TS < ROUTE_CLEANUP_INTERVAL:
+        return False
+    LAST_ROUTE_CLEANUP_TS = now
+
+    script = (
+        "$bad = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Status -ne 'Up' }; "
+        "$out = @(); "
+        "foreach ($a in $bad) { "
+        "  $routes = Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue; "
+        "  if ($routes) { "
+        "    $routes | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
+        "    $out += ($a.Name + ':' + $a.Status) "
+        "  } "
+        "}; "
+        "if ($out.Count -gt 0) { $out -join ',' } else { '' }"
+    )
+    code, out, err = run_powershell(script, timeout=20)
+    if code == 0 and out:
+        log("OK", f"已清理断开网卡的残留默认路由: {out}")
+        return True
+    if DEBUG_QUERY_FETCH and err:
+        log("DBG", f"残留路由检查: {err}")
+    return False
+
+
 def enable_wifi_interfaces(force=False):
     """只在接口确实被禁用时才启用它，避免反复 reset 掉正常的链路。"""
     run_cmd(["sc", "start", "WlanSvc"], timeout=8)
@@ -1053,6 +1107,7 @@ def connect_wifi_ssid(ssid=None, force=False):
     tried, all_candidates = wifi_profile_candidates()
     if not all_candidates and WIFI_AUTO_ADD_PROFILE:
         if add_open_wifi_profile(target):
+            log("WARN", f"未找到 {target} 的 profile（换网卡驱动会让接口 GUID 变化，旧 profile 留在旧 GUID 目录），已自动重建")
             tried = [target]
 
     if not tried:
@@ -1641,6 +1696,10 @@ def run_once():
 
     INTERNET_FAIL_STREAK += 1
 
+    # 只在断网时才查路由：正常联网零开销；拔线场景下第一时间清掉那条死路，
+    # 否则每个新连接都要先撞它、等 21 秒 TCP 超时。
+    cleanup_stale_default_routes()
+
     recovered = maybe_prepare_network_link(INTERNET_FAIL_STREAK)
     if recovered:
         connected, reason = check_internet(client, timeout=8)
@@ -1695,6 +1754,11 @@ def run_loop(interval):
         f"权限={'管理员' if is_admin() else '普通用户（无法启停网卡/打开WLAN开关）'}",
     )
     start_mtime = _script_mtime()
+    # 启动时先扫一次：如果开机时就带着残留死路，别等第一轮失败才发现
+    try:
+        cleanup_stale_default_routes()
+    except Exception as err:
+        log("DBG", f"启动路由检查失败: {short_exc(err)}")
     while True:
         try:
             run_once()

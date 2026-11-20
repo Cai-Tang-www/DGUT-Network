@@ -183,6 +183,48 @@ netsh wlan delete profile name="<profile名>" interface=WLAN
 
 注意：`netsh wlan set autoconfig enabled=yes` 和重置网卡对这个开关无效。
 
+### 拔掉网线后，所有网页都要黑屏 20 秒才加载
+
+原因不在 DNS，在路由。Windows 拔线后不会立刻删掉那块网卡的默认路由，而以太网的接口优先级（metric 25）通常高于 Wi-Fi（45）。于是每个新连接都先走那条已经断掉的死路，等 TCP 超时（约 21 秒）才回退到 Wi-Fi —— 表现就是黑屏 20 秒后突然加载。
+
+`campus_login.py` 每轮（默认 20 秒）检查一次：哪块网卡状态不是 `Up` 却还挂着 `0.0.0.0/0` 默认路由，就删掉那条。插回网线后 DHCP 会自己重建，不会影响正常使用。
+
+配置项：
+
+```yaml
+auto_route_cleanup: true    # 设为 false 可关闭
+```
+
+需要管理员权限（脚本本身以最高权限的计划任务运行）。手动处理一次：
+
+```powershell
+Get-NetRoute -InterfaceAlias "以太网" -DestinationPrefix "0.0.0.0/0" | Remove-NetRoute -Confirm:$false
+```
+
+### 换了 Python 版本后脚本不跑了
+
+计划任务里存的是解释器的**绝对路径**。旧版把 `Python312\pythonw.exe` 写死了，卸载 3.12 之后任务指向一个不存在的文件，于是：任务状态显示 Ready、`LastResult` 是个错误码、但永远不会出现 pythonw 进程。
+
+现在的 `switch_to_logon_task.ps1` 改为动态解析，优先级：
+
+1. `%SystemRoot%\pyw.exe`（官方 launcher）—— 换 Python 版本自动跟随，不用再重建任务
+2. 扫 `%LOCALAPPDATA%\Programs\Python\Python3*`，按版本号取最高
+3. PATH 里的 `pythonw.exe`（跳过 Microsoft Store 的假存根）
+
+换了 Python 只要重跑一次（管理员）：
+
+```text
+switch_to_logon_task.bat
+```
+
+再把依赖装到新版本上：
+
+```powershell
+py -3.13 -m pip install requests urllib3 curl_cffi
+```
+
+漏装依赖时，目录里会出现 `campus_login_crash.log`，里面写着用的是哪个解释器。
+
 ### 代理绕过（Clash / 系统代理）
 
 开了代理时认证流量被劫持会导致抓不到 `queryString`，把下列目标设为直连：

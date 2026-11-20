@@ -10,9 +10,12 @@ tmp_ref*/
 
 # Local runtime files
 *.log
+*.log.*
 *.lock
 healthcheck.log
 setup.log
+wifi_state.json
+campus_login_crash.log
 
 # Editor / agent workspace metadata
 .workbuddy/

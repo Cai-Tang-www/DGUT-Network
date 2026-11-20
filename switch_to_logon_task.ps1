@@ -37,13 +37,32 @@ if (-not (Test-Path -LiteralPath $pyScript)) {
     exit 3
 }
 
-$pyw = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\pythonw.exe'
-if (-not (Test-Path -LiteralPath $pyw)) {
+# Resolve the interpreter without pinning a Python version.
+# Preference order:
+#   1) pyw.exe (official launcher): keeps working after a Python upgrade
+#      without re-registering the task
+#   2) newest %LOCALAPPDATA%\Programs\Python\Python3XX\pythonw.exe
+#   3) pythonw.exe from PATH (skip the Microsoft Store alias stub)
+function Resolve-Pythonw {
+    $launcher = Join-Path $env:SystemRoot 'pyw.exe'
+    if (Test-Path -LiteralPath $launcher) { return $launcher }
+
+    $root = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+    $dirs = Get-ChildItem -LiteralPath $root -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+        Sort-Object { [int](($_.Name -replace '\D', '')) } -Descending
+    foreach ($d in $dirs) {
+        $p = Join-Path $d.FullName 'pythonw.exe'
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+
     $cmd = Get-Command pythonw.exe -ErrorAction SilentlyContinue
-    if ($cmd) { $pyw = $cmd.Source }
+    if ($cmd -and $cmd.Source -notlike '*WindowsApps*') { return $cmd.Source }
+    return $null
 }
-if (-not (Test-Path -LiteralPath $pyw)) {
-    Say '[ERR] pythonw.exe not found'
+
+$pyw = Resolve-Pythonw
+if (-not $pyw) {
+    Say '[ERR] pythonw.exe not found (install Python 3.9+ or add it to PATH)'
     exit 4
 }
 

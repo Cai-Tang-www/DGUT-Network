@@ -41,7 +41,9 @@ wifi_recovery_cooldown: 300
 # 恢复失败后的重试间隔（秒），别停太久
 wifi_recovery_retry: 15
 # 机器上没有匹配 profile 时是否自动新建（写 UTF-8 hex SSID，避免造出影子网络）
-wifi_auto_add_profile: false
+wifi_auto_add_profile: true
+# 拔网线后清掉断开网卡残留的默认路由（否则新连接先走死路，等 21s 超时才回退 WiFi）
+auto_route_cleanup: true
 # 发起连接后等待确认的秒数
 wifi_connect_wait: 8
 wifi_retry_interval: 60
